@@ -66,10 +66,10 @@ def make_classification_train_transform(
     mean: Sequence[float] = IMAGENET_DEFAULT_MEAN,
     std: Sequence[float] = IMAGENET_DEFAULT_STD,
 ):
-    v2_list = [v2.RandomResizedCrop(crop_size, interpolation=interpolation)]
+    transforms_list = [v2.RandomResizedCrop(crop_size, interpolation=interpolation)]
     if hflip_prob > 0.0:
-        v2_list.append(v2.RandomHorizontalFlip(hflip_prob))
-    v2_list.append(make_base_transform(mean, std))
+        transforms_list.append(v2.RandomHorizontalFlip(hflip_prob))
+    transforms_list.append(make_base_transform(mean, std))
     transform = v2.Compose(transforms_list)
     logger.info(f"Built classification train transform\n{transform}")
     return transform
