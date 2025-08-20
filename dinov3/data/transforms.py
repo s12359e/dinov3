@@ -25,7 +25,7 @@ class GaussianBlur(v2.RandomApply):
         # NOTE: torchvision is applying 1 - probability to return the original image
         keep_p = 1 - p
         transform = v2.GaussianBlur(kernel_size=9, sigma=(radius_min, radius_max))
-        super().__init__(v2=[transform], p=keep_p)
+        super().__init__(transforms=[transform], p=keep_p)
 
 
 # Use timm's names
