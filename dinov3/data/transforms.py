@@ -90,7 +90,7 @@ def make_resize_transform(
         return transform
     elif resize_large_side:
         logger.info("resizing based on large side")
-        transform = v2.Resize(max_size=size, interpolation=interpolation)
+        transform = v2.Resize(size=None, max_size=resize_size, interpolation=interpolation)
         return transform
     else:
         transform = v2.Resize(resize_size, interpolation=interpolation)
