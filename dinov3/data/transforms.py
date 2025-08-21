@@ -49,7 +49,6 @@ def make_base_transform(
 ) -> v2.Normalize:
     return v2.Compose(
         [
-            v2.ToImage(),
             v2.ToDtype(torch.float32, scale=True),
             make_normalize_transform(mean=mean, std=std),
         ]
@@ -66,7 +65,7 @@ def make_classification_train_transform(
     mean: Sequence[float] = IMAGENET_DEFAULT_MEAN,
     std: Sequence[float] = IMAGENET_DEFAULT_STD,
 ):
-    transforms_list = [v2.RandomResizedCrop(crop_size, interpolation=interpolation)]
+    transforms_list = [v2.ToImage(), v2.RandomResizedCrop(crop_size, interpolation=interpolation)]
     if hflip_prob > 0.0:
         transforms_list.append(v2.RandomHorizontalFlip(hflip_prob))
     transforms_list.append(make_base_transform(mean, std))
@@ -108,7 +107,7 @@ def make_eval_transform(
     mean: Sequence[float] = IMAGENET_DEFAULT_MEAN,
     std: Sequence[float] = IMAGENET_DEFAULT_STD,
 ) -> v2.Compose:
-    transforms_list = []
+    transforms_list = [v2.ToImage()]
     resize_transform = make_resize_transform(
         resize_size=resize_size,
         resize_square=resize_square,
