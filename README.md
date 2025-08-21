@@ -245,13 +245,13 @@ from torchvision.transforms import v2
 
 def make_transform(resize_size: int = 224):
     to_tensor = v2.ToImage()
-    resize = v2.Resize((resize_size, resize_size), antialias=True)
     to_float = v2.ToDtype(torch.float32, scale=True)
+    resize = v2.Resize((resize_size, resize_size), antialias=True)
     normalize = v2.Normalize(
         mean=(0.485, 0.456, 0.406),
         std=(0.229, 0.224, 0.225),
     )
-    return v2.Compose([to_tensor, resize, to_float, normalize])
+    return v2.Compose([to_tensor, to_float, resize, normalize])
 ```
 
 
@@ -264,13 +264,13 @@ from torchvision.transforms import v2
 
 def make_transform(resize_size: int = 224):
     to_tensor = v2.ToImage()
-    resize = v2.Resize((resize_size, resize_size), antialias=True)
     to_float = v2.ToDtype(torch.float32, scale=True)
+    resize = v2.Resize((resize_size, resize_size), antialias=True)
     normalize = v2.Normalize(
         mean=(0.430, 0.411, 0.296),
         std=(0.213, 0.156, 0.143),
     )
-    return v2.Compose([to_tensor, resize, to_float, normalize])
+    return v2.Compose([to_tensor, to_float, resize, normalize])
 ```
 
 ### Pretrained heads - Image classification
@@ -348,13 +348,13 @@ def get_img():
 
 def make_transform(resize_size: int | list[int] = 768):
     to_tensor = v2.ToImage()
-    resize = v2.Resize((resize_size, resize_size), antialias=True)
     to_float = v2.ToDtype(torch.float32, scale=True)
+    resize = v2.Resize((resize_size, resize_size), antialias=True)
     normalize = v2.Normalize(
         mean=(0.485, 0.456, 0.406),
         std=(0.229, 0.224, 0.225),
     )
-    return v2.Compose([to_tensor, resize, to_float, normalize])
+    return v2.Compose([to_tensor, to_float, resize, normalize])
 
 depther = torch.hub.load(REPO_DIR, 'dinov3_vit7b16_dd', source="local", weights=<DEPTHER/CHECKPOINT/URL/OR/PATH>, backbone_weights=<BACKBONE/CHECKPOINT/URL/OR/PATH>)
 
@@ -451,13 +451,13 @@ def get_img():
 
 def make_transform(resize_size: int | list[int] = 768):
     to_tensor = v2.ToImage()
-    resize = v2.Resize((resize_size, resize_size), antialias=True)
     to_float = v2.ToDtype(torch.float32, scale=True)
+    resize = v2.Resize((resize_size, resize_size), antialias=True)
     normalize = v2.Normalize(
         mean=(0.485, 0.456, 0.406),
         std=(0.229, 0.224, 0.225),
     )
-    return v2.Compose([to_tensor, resize, to_float, normalize])
+    return v2.Compose([to_tensor, to_float, resize, normalize])
 
 segmentor = torch.hub.load(REPO_DIR, 'dinov3_vit7b16_ms', source="local", weights=<SEGMENTOR/CHECKPOINT/URL/OR/PATH>, backbone_weights=<BACKBONE/CHECKPOINT/URL/OR/PATH>)
 
