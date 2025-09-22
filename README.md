@@ -243,7 +243,7 @@ For models using the LVD-1689M weights (pretrained on web images), please use th
 import torchvision
 from torchvision.transforms import v2
 
-def make_transform(resize_size: int = 224):
+def make_transform(resize_size: int = 256):
     to_tensor = v2.ToImage()
     resize = v2.Resize((resize_size, resize_size), antialias=True)
     to_float = v2.ToDtype(torch.float32, scale=True)
@@ -262,7 +262,7 @@ For models using the SAT-493M weights (pretrained on satellite imagery), please 
 import torchvision
 from torchvision.transforms import v2
 
-def make_transform(resize_size: int = 224):
+def make_transform(resize_size: int = 256):
     to_tensor = v2.ToImage()
     resize = v2.Resize((resize_size, resize_size), antialias=True)
     to_float = v2.ToDtype(torch.float32, scale=True)
