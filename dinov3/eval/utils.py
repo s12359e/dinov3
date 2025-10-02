@@ -76,18 +76,23 @@ def wrap_model(
 
 
 class ModelWithIntermediateLayers(nn.Module):
-    def __init__(self, feature_model, n_last_blocks, autocast_ctx):
+    def __init__(self, feature_model, n, autocast_ctx, reshape=False, return_class_token=True):
         super().__init__()
         self.feature_model = feature_model
         self.feature_model.eval()
-        self.n_last_blocks = n_last_blocks
+        self.n = n  # Layer indices (Sequence) or n last layers (int) to take
         self.autocast_ctx = autocast_ctx
+        self.reshape = reshape
+        self.return_class_token = return_class_token
 
     def forward(self, images):
         with torch.inference_mode():
             with self.autocast_ctx():
                 features = self.feature_model.get_intermediate_layers(
-                    images, n=self.n_last_blocks, return_class_token=True
+                    images,
+                    n=self.n,
+                    reshape=self.reshape,
+                    return_class_token=self.return_class_token
                 )
         return features
 
