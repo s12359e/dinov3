@@ -432,6 +432,16 @@ detector = torch.hub.load(REPO_DIR, 'dinov3_vit7b16_de', source="local", weights
 segmentor = torch.hub.load(REPO_DIR, 'dinov3_vit7b16_ms', source="local", weights=<SEGMENTOR/CHECKPOINT/URL/OR/PATH>, backbone_weights=<BACKBONE/CHECKPOINT/URL/OR/PATH>)
 ```
 
+Example command to run a full inference on ADE20K with the provided segmentor (ViT-7B + M2F):
+
+```shell
+PYTHONPATH=. python -m dinov3.run.submit dinov3/eval/segmentation/run.py \
+config=dinov3/eval/segmentation/configs/config-ade20k-m2f-inference.yaml  \
+datasets.root=<PATH/TO/DATASET> \
+load_from=dinov3_vit7b16_ms \
+--output-dir <PATH/TO/OUTPUT/DIR>
+```
+
 Full example code of segmentator on an image
 
 ```python
@@ -703,6 +713,20 @@ PYTHONPATH=${PWD} python -m dinov3.run.submit dinov3/eval/linear.py \
   train.val_dataset=ImageNet:split=VAL:root=<PATH/TO/DATASET>:extra=<PATH/TO/DATASET>
 ```
 
+### Linear segmentation with data augmentation on ADE20K
+
+```shell
+PYTHONPATH=. python -m dinov3.run.submit dinov3/eval/segmentation/run.py \
+model.dino_hub=dinov3_vit7b16 \
+config=dinov3/eval/segmentation/configs/config-ade20k-linear-training.yaml \
+datasets.root=<PATH/TO/DATASET> \
+--output-dir <PATH/TO/OUTPUT/DIR>
+```
+
+After the job completes, you will find in the output path directory you specified
+- `segmentation_config.yaml` that contains the config you trained the model with;
+- `model_final.pth`, the final linear head checkpoint at the end of training; and
+- `results-semantic-segmentation.csv` with the final metrics.
 
 ### Text alignment on DINOv3 using dino.txt
 

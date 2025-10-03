@@ -79,6 +79,7 @@ def make_dataset(
     dataset_str: str,
     transform: Optional[Callable] = None,
     target_transform: Optional[Callable] = None,
+    transforms: Optional[Callable] = None,
 ):
     """
     Creates a dataset with the specified parameters.
@@ -87,6 +88,7 @@ def make_dataset(
         dataset_str: A dataset string description (e.g. ImageNet:split=TRAIN).
         transform: A transform to apply to images.
         target_transform: A transform to apply to targets.
+        transforms: A transform to apply to both images and targets.
 
     Returns:
         The created dataset.
@@ -94,7 +96,7 @@ def make_dataset(
     logger.info(f'using dataset: "{dataset_str}"')
 
     class_, kwargs = _parse_dataset_str(dataset_str)
-    dataset = class_(transform=transform, target_transform=target_transform, **kwargs)
+    dataset = class_(transform=transform, target_transform=target_transform, transforms=transforms, **kwargs)
 
     logger.info(f"# of dataset samples: {len(dataset):,d}")
 
@@ -103,6 +105,8 @@ def make_dataset(
         dataset.transform = transform
     if not hasattr(dataset, "target_transform"):
         dataset.target_transform = target_transform
+    if not hasattr(dataset, "transforms"):
+        dataset.transforms = transforms
 
     return dataset
 
@@ -185,6 +189,7 @@ def make_data_loader(
     drop_last: bool = True,
     persistent_workers: bool = False,
     collate_fn: Optional[Callable[[List[T]], Any]] = None,
+    worker_init_fn: Optional[Callable[[List[T]], Any]] = None,
 ):
     """
     Creates a data loader with the specified parameters.
@@ -222,6 +227,7 @@ def make_data_loader(
         drop_last=drop_last,
         persistent_workers=persistent_workers,
         collate_fn=collate_fn,
+        worker_init_fn=worker_init_fn,
     )
 
     try:
