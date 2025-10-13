@@ -381,6 +381,48 @@ plt.axis("off")
 
 ```
 
+#### Reproduce paper results
+
+Make sure the NYU dataset is setup following [this](DATASETS.md#depth-estimation-on-nyu).
+
+Launch the following to reproduce our paper's depth estimation results on NYUv2 with the pretrained Depther trained on SYNTHMIX:
+
+```shell
+PYTHONPATH=. python -m dinov3.run.submit dinov3/eval/depth/run.py \
+config=dinov3/eval/depth/configs/config-nyu-synthmix-dpt-inference.yaml \
+datasets.root=$DATAROOT/NYU \
+load_from=dinov3_vit7b16_dd \
+--output-dir /checkpoint/dino/micramamonjisoa/test_dinov3_oss_eval/
+```
+
+Notes:
+- if you want to launch the code without dinov3.run.submit, you can do so using python directly or torchrun:
+
+```shell
+PYTHONPATH=. python dinov3/eval/depth/run.py \
+config=dinov3/eval/depth/configs/config-nyu-synthmix-dpt-inference.yaml \
+datasets.root=<PATH/TO/DATASET> \
+load_from=dinov3_vit7b16_dd \
+output_dir=<PATH/TO/OUTPUT/DIR>
+```
+
+- One can also save prediction results using `result_config.save_results=true`.
+
+
+#### Linear depth estimation on NYUv2 Depth
+```shell
+PYTHONPATH=. python -m dinov3.run.submit dinov3/eval/depth/run.py \
+    model.dino_hub=dinov3_vit7b16 \
+    config=dinov3/eval/depth/configs/config-nyu.yaml \
+    datasets.root=<PATH/TO/DATASET> \
+    --output-dir <PATH/TO/OUTPUT/DIR>
+```
+
+After the job completes, you will find in the output path directory you specified
+- `depth_config.yaml` that contains the config you trained the model with;
+- `model_final.pth`, the final linear head checkpoint at the end of training; and
+- `results-depth.csv` with the final metrics.
+
 ### Pretrained heads - Detector trained on COCO2017 dataset
 
 <table style="margin: auto">

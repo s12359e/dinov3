@@ -5,9 +5,8 @@
 
 import logging
 from enum import Enum
-from typing import Sequence, Union
 
-from dinov3.eval.dense.depth.models.embed import CenterPadding, StretchToMultiple
+from dinov3.eval.depth.models.embed import CenterPadding, StretchToMultiple
 from torch import Tensor, nn
 
 logger = logging.getLogger("dinov3")
@@ -22,7 +21,7 @@ class BackboneLayersSet(Enum):
 
 def _get_backbone_out_indices(
     model: nn.Module,
-    backbone_out_layers: Union[list[int], BackboneLayersSet] = BackboneLayersSet.FOUR_EVEN_INTERVALS,
+    backbone_out_layers: list[int] | tuple[int, ...] | BackboneLayersSet = BackboneLayersSet.FOUR_EVEN_INTERVALS,
 ):
     """
     Get indices for output layers of the ViT backbone. For now there are 3 options available:
@@ -36,10 +35,10 @@ def _get_backbone_out_indices(
     ViT/g (40 blocks): [9, 19, 29, 39]
     """
     n_blocks = getattr(model, "n_blocks", 1)
-    if isinstance(backbone_out_layers, list):
-        out_indices = backbone_out_layers
-
-    if backbone_out_layers == BackboneLayersSet.LAST:
+    out_indices: list[int]
+    if isinstance(backbone_out_layers, (tuple, list)):
+        out_indices = list(backbone_out_layers)
+    elif backbone_out_layers == BackboneLayersSet.LAST:
         out_indices = [n_blocks - 1]
     elif backbone_out_layers == BackboneLayersSet.FOUR_LAST:
         out_indices = [i for i in range(n_blocks - 4, n_blocks)]
@@ -65,7 +64,7 @@ class DinoVisionTransformerWrapper(nn.Module):
     def __init__(
         self,
         backbone_model: nn.Module,
-        backbone_out_layers: Union[str, list[int]],
+        backbone_out_layers: str | tuple[int, ...] | BackboneLayersSet,
         use_backbone_norm: bool = False,
         adapt_to_patch_size: PatchSizeAdaptationStrategy = PatchSizeAdaptationStrategy.CENTER_PADDING,
     ):
@@ -73,38 +72,32 @@ class DinoVisionTransformerWrapper(nn.Module):
 
         self.final_norm = use_backbone_norm
         self.backbone = backbone_model
-        self.backbone_out_indices = _get_backbone_out_indices(
-            self.backbone,
-            backbone_out_layers=(
-                backbone_out_layers if isinstance(backbone_out_layers, list) else BackboneLayersSet(backbone_out_layers)
-            ),
-        )
+        if isinstance(backbone_out_layers, str):
+            backbone_out_layers = BackboneLayersSet(backbone_out_layers)
+        self.backbone_out_indices = _get_backbone_out_indices(self.backbone, backbone_out_layers=backbone_out_layers)
 
         # If the backbone does not define embed_dims, use [embed_dim] * n_blocks
         try:
-            embed_dims = self.backbone.embed_dims
+            embed_dims: list[int] = getattr(self.backbone, "embed_dims")
         except AttributeError:
-            embed_dim = self.backbone.embed_dim
-            n_blocks = self.backbone.n_blocks
-            logger.warning(f"Backbone does not define embed_dims, using {[embed_dim] * n_blocks=} instead")
+            embed_dim: int = getattr(self.backbone, "embed_dim")
+            n_blocks: int = getattr(self.backbone, "n_blocks")
+            logger.warning(f"Backbone does not define embed_dims, using {[embed_dim] * n_blocks} instead")
             embed_dims = [embed_dim] * n_blocks
-        self.embed_dims: Sequence[int] = [embed_dims[idx] for idx in self.backbone_out_indices]
+        self.embed_dims = [embed_dims[idx] for idx in self.backbone_out_indices]
 
         # How to adapt input images to the patch size of the model?
         try:
-            input_pad_size = self.backbone.input_pad_size
+            input_pad_size = getattr(self.backbone, "input_pad_size")
         except AttributeError:
-            patch_size = self.backbone.patch_size
+            patch_size = getattr(self.backbone, "patch_size")
             logger.warning(f"Backbone does not define input_pad_size, using {patch_size=} instead")
             input_pad_size = patch_size
+        self.patch_size_adapter: nn.Module = nn.Identity()
         if adapt_to_patch_size is PatchSizeAdaptationStrategy.CENTER_PADDING:
             self.patch_size_adapter = CenterPadding(input_pad_size)
         elif adapt_to_patch_size is PatchSizeAdaptationStrategy.STRETCH:
             self.patch_size_adapter = StretchToMultiple(input_pad_size)
-        elif adapt_to_patch_size is PatchSizeAdaptationStrategy.NO_ADAPTATION:
-            self.patch_size_adapter = nn.Identity()
-        else:
-            raise ValueError(f"Unknown value {adapt_to_patch_size=}")
 
         # Freeze backbone
         self.backbone.requires_grad_(False)
@@ -114,7 +107,7 @@ class DinoVisionTransformerWrapper(nn.Module):
         x: Tensor,  # [B, rgb, H, W]
     ) -> list[tuple[Tensor, Tensor]]:
         x = self.patch_size_adapter(x)
-        outputs = self.backbone.get_intermediate_layers(
+        outputs = self.backbone.get_intermediate_layers(  # type: ignore
             x,
             n=self.backbone_out_indices,
             reshape=True,
