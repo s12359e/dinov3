@@ -83,7 +83,6 @@ class FeaturesToDepth(torch.nn.Module):
                     torch.log(torch.tensor(self.max_depth)),
                     n_bins,
                     device=x.device,
-                    dtype=self.dtype,
                 )
                 bins = torch.exp(bins)
 

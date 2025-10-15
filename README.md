@@ -390,9 +390,9 @@ Launch the following to reproduce our paper's depth estimation results on NYUv2 
 ```shell
 PYTHONPATH=. python -m dinov3.run.submit dinov3/eval/depth/run.py \
 config=dinov3/eval/depth/configs/config-nyu-synthmix-dpt-inference.yaml \
-datasets.root=$DATAROOT/NYU \
+datasets.root=<PATH/TO/DATASET> \
 load_from=dinov3_vit7b16_dd \
---output-dir /checkpoint/dino/micramamonjisoa/test_dinov3_oss_eval/
+--output-dir <PATH/TO/OUTPUT/DIR>
 ```
 
 Notes:
