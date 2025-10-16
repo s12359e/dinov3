@@ -10,7 +10,7 @@ from typing import Any, Callable, List, Optional, TypeVar
 import torch
 from torch.utils.data import Sampler
 
-from .datasets import ADE20K, CocoCaptions, ImageNet, ImageNet22k
+from .datasets import ADE20K, CocoCaptions, ImageNet, ImageNet22k, NYU
 from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler
 
 logger = logging.getLogger("dinov3")
@@ -68,6 +68,10 @@ def _parse_dataset_str(dataset_str: str):
         class_ = CocoCaptions
         if "split" in kwargs:
             kwargs["split"] = CocoCaptions.Split[kwargs["split"]]
+    elif name == "NYU":
+        class_ = NYU
+        if "split" in kwargs:
+            kwargs["split"] = NYU.Split[kwargs["split"]]
     else:
         raise ValueError(f'Unsupported dataset "{name}"')
 
@@ -206,6 +210,7 @@ def make_data_loader(
         drop_last: Whether the last non-full batch of data should be dropped.
         persistent_workers: maintain the workers Dataset instances alive after a dataset has been consumed once.
         collate_fn: Function that performs batch collation
+        worker_init_fn: Optional init function for each dataloader worker.
     """
 
     sampler = _make_sampler(

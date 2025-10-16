@@ -2,12 +2,37 @@
 #
 # This software may be used and distributed in accordance with
 # the terms of the DINOv3 License Agreement.
+from dataclasses import dataclass, field
+from functools import partial
+from typing import Any
 
 import torch
-from dinov3.eval.dense.depth.utils import cast_to
+from dinov3.eval.depth.checkpoint_utils import load_checkpoint
 
 from .dpt_head import DPTHead
+from .linear_head import LinearHead
 from .encoder import BackboneLayersSet, DinoVisionTransformerWrapper, PatchSizeAdaptationStrategy
+
+
+@dataclass
+class DecoderConfig:
+    min_depth: float = 0.001
+    max_depth: float = 80
+    bins_strategy: str = "linear"  # (choice: ["linear", "log"]) distribution of bins across the range
+    norm_strategy: str = (
+        "linear"  # (choice: ["linear", "softmax", "sigmoid"]) activation used before normalization of depth-bin logits
+    )
+    head_kwargs: dict[str, Any] = field(default_factory=dict)
+    backbone_out_layers: Any = (
+        BackboneLayersSet.FOUR_EVEN_INTERVALS  # One of BackboneLayersSet(Enum) or a list of indices e.g. [0, 1, 2, 3]
+    )
+    adapt_to_patch_size: PatchSizeAdaptationStrategy = PatchSizeAdaptationStrategy.CENTER_PADDING
+    use_backbone_norm: bool = True
+    # decoder
+    type: str = "linear"  # choices: linear or dpt
+    n_output_channels: int = 256
+    use_batchnorm: bool = False
+    use_cls_token: bool = False
 
 
 class FeaturesToDepth(torch.nn.Module):
@@ -85,23 +110,26 @@ def make_head(
     n_output_channels: int,
     use_batchnorm: bool = False,
     use_cls_token: bool = False,
-    # upsample: int = 4,
     head_type: str = "linear",
     **kwargs,
 ) -> torch.nn.Module:
-
     if isinstance(embed_dims, int):
         embed_dims = [embed_dims]
-
+    decoder: torch.nn.Module
     if head_type == "linear":
-        raise NotImplementedError
+        decoder = LinearHead(
+            in_channels=embed_dims,
+            n_output_channels=n_output_channels,
+            use_batchnorm=use_batchnorm,
+            use_cls_token=use_cls_token,
+        )
     elif head_type == "dpt":
         decoder = DPTHead(
             in_channels=embed_dims,
             n_output_channels=n_output_channels,
             readout_type="project" if use_cls_token else "ignore",
             use_batchnorm=use_batchnorm,
-            **kwargs,  # TODO add here post_process_channels, n_hidden_channels
+            **kwargs,
         )
     else:
         raise NotImplementedError("only linear and DPT head supported")
@@ -113,35 +141,63 @@ class EncoderDecoder(torch.nn.Module):
         self,
         encoder: torch.nn.Module,
         decoder: torch.nn.Module,
-        encoder_dtype=torch.float,
-        decoder_dtype=torch.float,
     ):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
-        self.encoder_dtype = encoder_dtype
-        self.decoder_dtype = decoder_dtype
-        self.is_cuda = torch.cuda.is_available()
 
     def forward(self, x):
-        with torch.autocast("cuda" if torch.cuda.is_available() else "cpu", enabled=False):
-            x = x.to(self.encoder_dtype)
+        x = self.encoder(x)
+        x = self.decoder(x)
+        return x
+
+
+class Depther(torch.nn.Module):
+    def __init__(
+        self,
+        encoder: torch.nn.Module,
+        decoder: torch.nn.Module,
+        min_depth: float,
+        max_depth: float,
+        bins_strategy: str = "linear",
+        norm_strategy: str = "linear",
+        autocast_dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+        self.features_to_depth = FeaturesToDepth(
+            min_depth=min_depth,
+            max_depth=max_depth,
+            bins_strategy=bins_strategy,
+            norm_strategy=norm_strategy,
+        )
+        if torch.cuda.is_available():
+            self.autocast_ctx = partial(torch.autocast, device_type="cuda", dtype=autocast_dtype, enabled=True)
+            self.encoder.cuda()
+            self.decoder.cuda()
+        else:
+            self.autocast_ctx = partial(torch.autocast, device_type="cpu", enabled=True)
+
+    def forward(self, x):
+        with self.autocast_ctx():
             x = self.encoder(x)
-            x = cast_to(x, self.decoder_dtype)
-        return self.decoder(x)
+            x = self.decoder(x)
+            x = self.features_to_depth(x)
+        return x
 
 
 def build_depther(
     backbone: torch.nn.Module,
-    backbone_out_layers: list[int] | BackboneLayersSet,
+    backbone_out_layers: tuple[int, ...] | BackboneLayersSet,
     n_output_channels: int,
     use_backbone_norm: bool = False,
     use_batchnorm: bool = False,
     use_cls_token: bool = False,
     adapt_to_patch_size: PatchSizeAdaptationStrategy = PatchSizeAdaptationStrategy.CENTER_PADDING,
     head_type: str = "dpt",
-    encoder_dtype: torch.dtype = torch.float,
-    decoder_dtype: torch.dtype = torch.float,
+    autocast_dtype: torch.dtype = torch.float32,
     # depth args
     min_depth: float = 0.001,
     max_depth: float = 10.0,
@@ -155,8 +211,6 @@ def build_depther(
         use_backbone_norm=use_backbone_norm,
         adapt_to_patch_size=adapt_to_patch_size,
     )
-    encoder = encoder.to(encoder_dtype)
-    encoder.eval()
 
     decoder = make_head(
         encoder.embed_dims,
@@ -166,21 +220,47 @@ def build_depther(
         head_type=head_type,
         **kwargs,
     )
-    decoder.eval()
 
-    features_to_depth = FeaturesToDepth(
+    depther = Depther(
+        encoder=encoder,
+        decoder=decoder,
         min_depth=min_depth,
         max_depth=max_depth,
         bins_strategy=bins_strategy,
         norm_strategy=norm_strategy,
+        autocast_dtype=autocast_dtype,
+    )
+    depther.eval()
+    return depther
+
+
+def make_depther_from_config(
+    backbone,
+    config: DecoderConfig,
+    checkpoint_path: str | None = None,
+    autocast_dtype: torch.dtype = torch.float32,
+) -> Depther:
+    depther = build_depther(
+        backbone,
+        backbone_out_layers=config.backbone_out_layers,
+        n_output_channels=config.n_output_channels,
+        use_backbone_norm=config.use_backbone_norm,
+        use_batchnorm=config.use_batchnorm,
+        use_cls_token=config.use_cls_token,
+        adapt_to_patch_size=config.adapt_to_patch_size,
+        head_type=config.type,
+        autocast_dtype=autocast_dtype,
+        min_depth=config.min_depth,
+        max_depth=config.max_depth,
+        bins_strategy=config.bins_strategy,
+        norm_strategy=config.norm_strategy,
+        **config.head_kwargs,
     )
 
-    return torch.nn.Sequential(
-        EncoderDecoder(
-            encoder,
-            decoder,
-            encoder_dtype=encoder_dtype,
-            decoder_dtype=decoder_dtype,
-        ),
-        features_to_depth,
-    )
+    # resume from checkpoint
+    if checkpoint_path is not None:
+        state_dicts, _ = load_checkpoint(checkpoint_path)
+        # load head state dict, the backbone has its pretrained_weights
+        depther.decoder.load_state_dict(state_dicts["model"], strict=True)
+
+    return depther

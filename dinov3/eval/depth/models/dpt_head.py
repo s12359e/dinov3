@@ -508,9 +508,9 @@ class DPTHead(nn.Module):
         self.conv_depth = UpConvHead(self.channels, self.n_output_channels)
 
     def forward_features(self, inputs):
-        assert (
-            len(inputs) == self.num_reassemble_blocks
-        ), f"Expected {self.num_reassemble_blocks} inputs, got {len(inputs)}."
+        assert len(inputs) == self.num_reassemble_blocks, (
+            f"Expected {self.num_reassemble_blocks} inputs, got {len(inputs)}."
+        )
         x = [inp for inp in inputs]
 
         x = self.reassemble_blocks(x)

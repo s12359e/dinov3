@@ -7,9 +7,7 @@ from enum import Enum
 from typing import Optional, Tuple
 
 import torch
-from dinov3.eval.dense.depth.models import build_depther
-from urllib.parse import urlparse
-from pathlib import Path
+from dinov3.eval.depth.models import DecoderConfig, make_depther_from_config
 
 from .utils import DINOV3_BASE_URL
 from .backbones import (
@@ -63,6 +61,35 @@ _BACKBONE_DICT = {
 }
 
 
+def _get_depther_config(
+    backbone_name: str = "dinov3_vit7b16",
+    depth_range: Optional[Tuple[float, float]] = None,
+    **kwargs,
+):
+    out_index = _get_out_layers(backbone_name)
+    post_process_channels = _get_post_process_channels(backbone_name)
+
+    depth_range = depth_range or _get_depth_range(DepthWeights(_DPT_HEAD_CONFIG_DICT["depth_weights"]))
+    min_depth, max_depth = depth_range
+    depther_config = DecoderConfig(
+        min_depth=min_depth,
+        max_depth=max_depth,
+        backbone_out_layers=out_index,
+        n_output_channels=_DPT_HEAD_CONFIG_DICT["n_output_channels"],  # type: ignore
+        use_backbone_norm=bool(_DPT_HEAD_CONFIG_DICT["use_backbone_norm"]),
+        use_batchnorm=bool(_DPT_HEAD_CONFIG_DICT["use_batchnorm"]),
+        use_cls_token=bool(_DPT_HEAD_CONFIG_DICT["use_cls_token"]),
+        type="dpt",
+        # DPTHead args
+        head_kwargs=dict(
+            channels=512,
+            post_process_channels=post_process_channels,
+        ),
+        **kwargs,
+    )
+    return depther_config
+
+
 def _make_dinov3_dpt_depther(
     *,
     backbone_name: str = "dinov3_vit7b16",
@@ -71,34 +98,18 @@ def _make_dinov3_dpt_depther(
     backbone_weights: BackboneWeights | str = BackboneWeights.LVD1689M,
     depth_range: Optional[Tuple[float, float]] = None,
     check_hash: bool = False,
-    backbone_dtype: torch.dtype = torch.float32,
+    autocast_dtype: torch.dtype = torch.float32,
     **kwargs,
 ):
     backbone: torch.nn.Module = _BACKBONE_DICT[backbone_name](
         pretrained=pretrained,
         weights=backbone_weights,
     )
-    out_index = _get_out_layers(backbone_name)
-    post_process_channels = _get_post_process_channels(backbone_name)
-
-    depth_range = depth_range or _get_depth_range(_DPT_HEAD_CONFIG_DICT["depth_weights"])
-    min_depth, max_depth = depth_range
-
-    depther = build_depther(
+    
+    depther = make_depther_from_config(
         backbone,
-        backbone_out_layers=out_index,
-        n_output_channels=_DPT_HEAD_CONFIG_DICT["n_output_channels"],
-        use_backbone_norm=_DPT_HEAD_CONFIG_DICT["use_backbone_norm"],
-        use_batchnorm=_DPT_HEAD_CONFIG_DICT["use_batchnorm"],
-        use_cls_token=_DPT_HEAD_CONFIG_DICT["use_cls_token"],
-        head_type="dpt",
-        encoder_dtype=backbone_dtype,
-        min_depth=min_depth,
-        max_depth=max_depth,
-        # DPTHead args
-        channels=512,
-        post_process_channels=post_process_channels,
-        **kwargs,
+        config=_get_depther_config(backbone_name, depth_range),
+        autocast_dtype=autocast_dtype,
     )
 
     if pretrained:
@@ -110,7 +121,7 @@ def _make_dinov3_dpt_depther(
         else:
             url = convert_path_or_url_to_url(depther_weights)
         checkpoint = torch.hub.load_state_dict_from_url(url, map_location="cpu", check_hash=check_hash)
-        depther[0].decoder.load_state_dict(checkpoint, strict=True)
+        depther.decoder.load_state_dict(checkpoint, strict=True)
     return depther
 
 
@@ -120,7 +131,7 @@ def dinov3_vit7b16_dd(
     weights: DepthWeights | str = DepthWeights.SYNTHMIX,
     backbone_weights: BackboneWeights | str = BackboneWeights.LVD1689M,
     check_hash: bool = False,
-    backbone_dtype: torch.dtype = torch.float32,
+    autocast_dtype: torch.dtype = torch.float32,
     **kwargs,
 ):
     return _make_dinov3_dpt_depther(
@@ -129,6 +140,6 @@ def dinov3_vit7b16_dd(
         depther_weights=weights,
         backbone_weights=backbone_weights,
         check_hash=check_hash,
-        backbone_dtype=backbone_dtype,
+        autocast_dtype=autocast_dtype,
         **kwargs,
     )
