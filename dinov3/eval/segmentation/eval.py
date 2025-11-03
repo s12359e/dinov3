@@ -94,6 +94,7 @@ def test_segmentation(backbone, config):
             hidden_dim=config.decoder_head.hidden_dim,  # Only used for instantiating a M2F head
             num_classes=config.decoder_head.num_classes,
             autocast_dtype=config.model_dtype.autocast_dtype,
+            dropout=config.decoder_head.dropout,
         )
         state_dict = torch.load(config.load_from, map_location="cpu")["model"]
         _, _ = segmentation_model.load_state_dict(state_dict, strict=False)
@@ -108,6 +109,8 @@ def test_segmentation(backbone, config):
         inference_mode="slide",
         use_tta=config.eval.use_tta,
         tta_ratios=config.transforms.eval.tta_ratios,
+        mean=config.transforms.mean,
+        std=config.transforms.std,
     )
 
     test_dataset = DatasetWithEnumeratedTargets(

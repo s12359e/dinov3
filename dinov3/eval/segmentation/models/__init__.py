@@ -79,6 +79,7 @@ def build_segmentation_decoder(
     decoder_type="linear",
     hidden_dim=2048,
     num_classes=150,
+    dropout=0.1,
     autocast_dtype=torch.float32,
 ):
     backbone_indices_to_use = _get_backbone_out_indices(backbone_model, backbone_out_layers)
@@ -121,6 +122,7 @@ def build_segmentation_decoder(
         decoder = LinearHead(
             in_channels=embed_dim,
             n_output_channels=num_classes,
+            dropout=dropout,
         )
     else:
         raise ValueError(f'Unsupported decoder "{decoder_type}"')
