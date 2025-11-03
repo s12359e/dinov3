@@ -63,6 +63,7 @@ class DecoderConfig:
     use_backbone_norm: bool = True  # Uses the backbone's output normalization on all layers
     num_classes: int = 150  # Number of segmentation classes
     hidden_dim: int = 2048  # Hidden dimension, only used for M2F head
+    dropout: float = 0.1  # Dropout ratio in the linear head during training
 
 
 @dataclass

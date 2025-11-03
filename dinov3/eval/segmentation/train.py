@@ -156,6 +156,7 @@ def train_segmentation(
         "linear",
         num_classes=config.decoder_head.num_classes,
         autocast_dtype=config.model_dtype.autocast_dtype,
+        dropout=config.decoder_head.dropout,
     )
     global_device = distributed.get_rank()
     local_device = torch.cuda.current_device()
@@ -172,10 +173,14 @@ def train_segmentation(
         crop_size=config.transforms.train.crop_size,
         flip_prob=config.transforms.train.flip_prob,
         reduce_zero_label=config.eval.reduce_zero_label,
+        mean=config.transforms.mean,
+        std=config.transforms.std,
     )
     val_transforms = make_segmentation_eval_transforms(
         img_size=config.transforms.eval.img_size,
         inference_mode=config.eval.mode,
+        mean=config.transforms.mean,
+        std=config.transforms.std,
     )
 
     train_dataset = DatasetWithEnumeratedTargets(

@@ -17,6 +17,7 @@ class LinearHead(nn.Module):
         n_output_channels,
         use_batchnorm=True,
         use_cls_token=False,
+        dropout=0.1,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -27,7 +28,7 @@ class LinearHead(nn.Module):
         self.use_cls_token = use_cls_token
         self.batchnorm_layer = nn.SyncBatchNorm(self.channels) if use_batchnorm else nn.Identity(self.channels)
         self.conv = nn.Conv2d(self.channels, self.n_output_channels, kernel_size=1, padding=0, stride=1)
-        self.dropout = nn.Dropout2d(0.1)
+        self.dropout = nn.Dropout2d(dropout)
         nn.init.normal_(self.conv.weight, mean=0, std=0.01)
         nn.init.constant_(self.conv.bias, 0)
 
