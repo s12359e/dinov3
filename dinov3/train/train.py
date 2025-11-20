@@ -272,7 +272,7 @@ def build_data_loader_from_cfg(
 ):
     # Collate function
     img_size = cfg.crops.global_crops_size
-    patch_size = cfg.student.patch_size
+    patch_size = int(cfg.student.patch_size * cfg.crops.teacher_to_student_resolution_scale)
     n_tokens = (img_size // patch_size) ** 2
     mask_generator = MaskingGenerator(
         input_size=(img_size // patch_size, img_size // patch_size),
