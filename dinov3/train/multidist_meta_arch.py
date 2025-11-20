@@ -46,6 +46,16 @@ class MultiDistillationMetaArch(SSLMetaArch):
         global_batch_size = data["global_batch_size"]
 
         # Multidistillation codepath:
+
+        # Downsample teacher crops to match student resolution
+        downsampling_factor = getattr(self, "crops.teacher_to_student_resolution_scale", 1.0)
+        if downsampling_factor != 1.0:
+            global_crops = torch.nn.functional.interpolate(
+                global_crops,
+                scale_factor=1.0 / downsampling_factor,
+                mode="bilinear",
+                antialias=True,
+            )
         global_crops_subgroup = self.broadcast_to_subgroups(
             global_crops.view(n_global_crops, -1, *global_crops.shape[1:]),
             1,

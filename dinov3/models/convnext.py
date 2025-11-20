@@ -60,6 +60,7 @@ class Block(nn.Module):
         self.pwconv1 = nn.Linear(dim, 4 * dim)  # pointwise/1x1 convs, implemented with linear layers
         self.act = nn.GELU()
         self.pwconv2 = nn.Linear(4 * dim, dim)
+        self.layer_scale_init_value = layer_scale_init_value
         self.gamma = (
             nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
             if layer_scale_init_value > 0
@@ -94,13 +95,17 @@ class LayerNorm(nn.Module):
 
     def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(normalized_shape))
-        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.weight = nn.Parameter(torch.empty(normalized_shape))
+        self.bias = nn.Parameter(torch.empty(normalized_shape))
         self.eps = eps
         self.data_format = data_format
         if self.data_format not in ["channels_last", "channels_first"]:
             raise NotImplementedError
         self.normalized_shape = (normalized_shape,)
+
+    def init_weights(self):
+        nn.init.ones_(self.weight)
+        nn.init.zeros_(self.bias)
 
     def forward(self, x):
         if self.data_format == "channels_last":
@@ -193,16 +198,21 @@ class ConvNeXt(nn.Module):
 
     def init_weights(self):
         self.apply(self._init_weights)
+        for stage_id, stage in enumerate(self.stages):
+            for block_id, block in enumerate(stage):
+                if block.gamma is not None:
+                    nn.init.constant_(self.stages[stage_id][block_id].gamma, block.layer_scale_init_value)
 
     def _init_weights(self, module):
         if isinstance(module, nn.LayerNorm):
             module.reset_parameters()
         if isinstance(module, LayerNorm):
-            module.weight = nn.Parameter(torch.ones(module.normalized_shape))
-            module.bias = nn.Parameter(torch.zeros(module.normalized_shape))
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
         if isinstance(module, (nn.Conv2d, nn.Linear)):
-            torch.nn.init.trunc_normal_(module.weight, std=0.02)
-            nn.init.constant_(module.bias, 0)
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
 
     def forward_features(self, x: Tensor | List[Tensor], masks: Optional[Tensor] = None) -> List[Dict[str, Tensor]]:
         if isinstance(x, torch.Tensor):

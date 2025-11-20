@@ -169,6 +169,7 @@ crops:
   - 0.229
   - 0.224
   - 0.225
+  teacher_to_student_resolution_scale: 1.0
 evaluation:
   eval_period_iterations: 12500
   low_freq_every: 5
