@@ -7,11 +7,14 @@ Binary segmentation of 4×4-pixel metal-gate extrusion defects in 512×512 synth
 ```
 sem_defect_pipeline/
 ├── configs/
-│   ├── dinov3_vitb16_fpn_sem512.py           # Plain ViT backbone
-│   └── dinov3_adapter_vitb16_fpn_sem512.py   # ViT-Adapter backbone
+│   ├── dinov3_vitb16_fpn_sem512.py               # Plain ViT + PNG masks
+│   ├── dinov3_vitb16_fpn_yolo_sem512.py           # Plain ViT + YOLO labels
+│   ├── dinov3_adapter_vitb16_fpn_sem512.py        # ViT-Adapter + PNG masks
+│   └── dinov3_adapter_vitb16_fpn_yolo_sem512.py   # ViT-Adapter + YOLO labels
 ├── data_gen/
 │   └── generate_sem_dataset.py               # Synthetic SEM image generator
-└── dinov3_backbone.py                        # MMSeg backbone wrappers
+├── dinov3_backbone.py                        # MMSeg backbone wrappers
+└── transforms.py                            # Custom transforms (YOLO label loading)
 ```
 
 ## Synthetic SEM Images
@@ -47,6 +50,38 @@ data/sem_defect/
 ├── masks/{train,val,test}/*.png    # single-channel: 0=bg, 1=defect
 └── metadata.json                   # generation params + defect bboxes
 ```
+
+### Grayscale input
+
+Both single-channel and 3-channel grayscale images are supported. The data pipeline uses `LoadImageFromFile(color_type='color')`, which automatically converts single-channel grayscale to 3-channel (R=G=B) via `cv2.IMREAD_COLOR`. No preprocessing or manual conversion is needed.
+
+## Label Formats
+
+### PNG masks (default)
+
+Single-channel uint8 PNG where pixel values are class labels (0=background, 1=defect).
+
+```
+data/sem_defect/
+├── images/train/*.png
+└── masks/train/*.png       # same filename as image
+```
+
+Config: `dinov3_vitb16_fpn_sem512.py` or `dinov3_adapter_vitb16_fpn_sem512.py`
+
+### YOLO segmentation labels (.txt)
+
+Each line: `class_id x1 y1 x2 y2 ... xn yn` with normalized [0,1] polygon coordinates. Multiple lines per file for multiple instances. Empty or missing files are treated as pure background (negative samples).
+
+```
+data/sem_defect/
+├── images/train/*.png
+└── labels/train/*.txt      # same stem as image
+```
+
+Config: `dinov3_vitb16_fpn_yolo_sem512.py` or `dinov3_adapter_vitb16_fpn_yolo_sem512.py`
+
+The `LoadYOLOAnnotations` transform converts polygons to dense pixel masks at runtime. By default all YOLO classes map to label 1 (binary mode). Set `binary=False` for multi-class.
 
 ## Model Architecture
 
@@ -91,11 +126,17 @@ For the adapter backbone, you also need CUDA and the compiled `MultiScaleDeforma
 ## Training
 
 ```bash
-# Plain ViT backbone
+# Plain ViT + PNG masks
 python -m mmseg.tools.train sem_defect_pipeline/configs/dinov3_vitb16_fpn_sem512.py
 
-# ViT-Adapter backbone
+# Plain ViT + YOLO labels
+python -m mmseg.tools.train sem_defect_pipeline/configs/dinov3_vitb16_fpn_yolo_sem512.py
+
+# ViT-Adapter + PNG masks
 python -m mmseg.tools.train sem_defect_pipeline/configs/dinov3_adapter_vitb16_fpn_sem512.py
+
+# ViT-Adapter + YOLO labels
+python -m mmseg.tools.train sem_defect_pipeline/configs/dinov3_adapter_vitb16_fpn_yolo_sem512.py
 ```
 
 Before training, update `checkpoint` in the config to point to your DINOv3 ViT-B/16 pretrained weights.
@@ -111,7 +152,10 @@ Tested on CPU (PyTorch 2.10, mmseg 1.2.2):
 | Adapter backbone forward (stride 4/8/16/32 outputs) | Passed |
 | Full model build (EncoderDecoder via MMSeg registry) | Passed |
 | Loss computation (CrossEntropy + Dice) | Passed |
-| Data pipeline (LoadImage → Resize → PackSegInputs) | Passed |
+| Data pipeline — PNG masks (LoadImage → Resize → PackSegInputs) | Passed |
+| Data pipeline — YOLO labels (LoadYOLOAnnotations → polygon→mask) | Passed |
+| YOLO: single polygon, multi-polygon, empty file, missing file | Passed |
+| YOLO: multi-class mode (binary=False) | Passed |
 | Gradient flow + optimizer step (plain ViT) | Passed |
 | Inference / predict mode | Passed |
 

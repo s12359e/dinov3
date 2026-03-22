@@ -19,8 +19,12 @@ Directory layout expected under data_root:
     data/sem_defect/
         images/train/   *.png  (3-channel uint8, grayscale replicated)
         images/val/     *.png
-        masks/train/    *.png  (single-channel: 0=background, 1=defect)
-        masks/val/      *.png
+        masks/train/    *.png or *.txt  (PNG mask or YOLO segmentation label)
+        masks/val/      *.png or *.txt
+
+    For YOLO .txt labels, set seg_map_suffix='.txt' and replace
+    LoadAnnotations with LoadYOLOAnnotations in the pipeline.
+    See dinov3_vitb16_fpn_yolo_sem512.py for a ready-to-use config.
 """
 
 # ─── Base configs ────────────────────────────────────────────────────────────
