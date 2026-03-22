@@ -36,13 +36,15 @@ dataset_type = 'BaseSegDataset'
 data_root = 'data/sem_defect'
 crop_size = (512, 512)
 
-# SEM images are grayscale but saved as 3-channel (R=G=B).
-# Mean/std computed for that convention (pixel range ~[0, 255], grey-scale ~128).
-img_mean = [128.0, 128.0, 128.0]
-img_std  = [64.0,  64.0,  64.0]
+# Per-channel mean/std in 0-255 scale.
+# Derived from: mean=(0.430, 0.411, 0.296), std=(0.213, 0.156, 0.143) in 0-1 scale.
+img_mean = [109.65, 104.81, 75.48]
+img_std  = [54.32,  39.78,  36.47]
 
 train_pipeline = [
-    dict(type='LoadImageFromFile'),
+    # color_type='color' ensures single-channel grayscale images are
+    # automatically converted to 3-channel (R=G=B) by cv2.IMREAD_COLOR.
+    dict(type='LoadImageFromFile', color_type='color'),
     dict(type='LoadAnnotations', reduce_zero_label=False),
     dict(type='RandomResize',
          scale=crop_size,
@@ -61,7 +63,7 @@ train_pipeline = [
 ]
 
 val_pipeline = [
-    dict(type='LoadImageFromFile'),
+    dict(type='LoadImageFromFile', color_type='color'),
     dict(type='Resize', scale=crop_size, keep_ratio=False),
     dict(type='LoadAnnotations', reduce_zero_label=False),
     dict(type='PackSegInputs'),
