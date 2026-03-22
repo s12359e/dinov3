@@ -16,3 +16,9 @@ dist/
 
 # Ignore vscode directory
 .vscode/
+
+# Claude Code local settings
+.claude/
+
+# Generated data (re-create via generate_sem_dataset.py)
+data/
