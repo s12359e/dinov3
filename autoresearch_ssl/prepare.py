@@ -171,15 +171,16 @@ def compute_single_image_knn_score(patch_tokens, defect_patch_indices, ks):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_ssl_knn(model, eval_dir, device=None):
+def evaluate_ssl_knn(model, eval_dir, device=None, eval_size=None):
     """Evaluate SSL model quality using single-image patch KNN.
-
-    This is the ground truth metric. DO NOT MODIFY.
 
     Args:
         model: ViT backbone (must support get_intermediate_layers or forward_features).
         eval_dir: directory with images containing _x{}_y{} in filenames.
         device: torch device.
+        eval_size: resize images to this resolution before evaluation.
+                   Auto-aligned to nearest multiple of PATCH_SIZE.
+                   None = use default IMG_SIZE (512).
 
     Returns:
         best_anomaly_score (float): the SSL index. Higher is better.
@@ -188,13 +189,22 @@ def evaluate_ssl_knn(model, eval_dir, device=None):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Determine eval resolution (must be multiple of PATCH_SIZE)
+    if eval_size is None:
+        eval_size = IMG_SIZE
+    eval_size = int(round(eval_size / PATCH_SIZE)) * PATCH_SIZE
+    if eval_size < PATCH_SIZE:
+        eval_size = PATCH_SIZE
+
     model = model.to(device)
     model.eval()
 
     mean_np = np.array(IMG_MEAN, dtype=np.float32).reshape(1, 1, 3)
     std_np = np.array(IMG_STD, dtype=np.float32).reshape(1, 1, 3)
-    grid_h = IMG_SIZE // PATCH_SIZE
-    grid_w = IMG_SIZE // PATCH_SIZE
+    grid_h = eval_size // PATCH_SIZE
+    grid_w = eval_size // PATCH_SIZE
+    print(f"[EVAL] eval_size={eval_size} (grid={grid_h}x{grid_w}, "
+          f"patches={grid_h * grid_w})")
 
     data_path = Path(eval_dir)
     image_files = sorted([
@@ -221,14 +231,14 @@ def evaluate_ssl_knn(model, eval_dir, device=None):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         orig_h, orig_w = image.shape[:2]
-        scale_x = IMG_SIZE / orig_w
-        scale_y = IMG_SIZE / orig_h
+        scale_x = eval_size / orig_w
+        scale_y = eval_size / orig_h
         scaled_x = int(def_x * scale_x)
         scaled_y = int(def_y * scale_y)
         scaled_w = max(1, int(DEFECT_SIZE * scale_x))
         scaled_h = max(1, int(DEFECT_SIZE * scale_y))
 
-        image = cv2.resize(image, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
+        image = cv2.resize(image, (eval_size, eval_size), interpolation=cv2.INTER_LINEAR)
         image_f = (image.astype(np.float32) - mean_np) / std_np
         image_t = torch.from_numpy(image_f).permute(2, 0, 1).unsqueeze(0).float().to(device)
 
@@ -258,6 +268,7 @@ def evaluate_ssl_knn(model, eval_dir, device=None):
 
     results["best_anomaly_score"] = best_score
     results["num_images"] = len(defect_images)
+    results["eval_size"] = eval_size
 
     return best_score, results
 

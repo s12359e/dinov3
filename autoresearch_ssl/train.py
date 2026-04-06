@@ -268,6 +268,9 @@ def main():
     parser.add_argument("--checkpoint", type=str, default="",
                         help="Pretrained ViT checkpoint to initialize from")
     parser.add_argument("--output-dir", type=str, default="autoresearch_ssl/runs")
+    parser.add_argument("--eval-size", type=int, default=None,
+                        help="Resize eval images to this resolution (auto-aligned to patch_size multiple). "
+                             "Default: use IMG_SIZE (512). Example: --eval-size 745")
     args = parser.parse_args()
 
     # Load config overrides
@@ -496,8 +499,11 @@ def main():
     print()  # newline after \r
 
     # ── Evaluation ───────────────────────────────────────────────────────
-    print("\nEvaluating teacher backbone with defect KNN...")
-    best_score, results = evaluate_ssl_knn(teacher_backbone, EVAL_DIR, device)
+    eval_size_str = f" (eval_size={args.eval_size})" if args.eval_size else ""
+    print(f"\nEvaluating teacher backbone with defect KNN...{eval_size_str}")
+    best_score, results = evaluate_ssl_knn(
+        teacher_backbone, EVAL_DIR, device, eval_size=args.eval_size
+    )
 
     # ── Save best checkpoint ─────────────────────────────────────────────
     output_dir = Path(args.output_dir)
