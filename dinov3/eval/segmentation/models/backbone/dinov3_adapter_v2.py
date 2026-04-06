@@ -328,7 +328,7 @@ class SpatialPriorModule(nn.Module):
                 self.fc3(c3_raw),
                 self.fc4(c4_raw),
             ])
-            return feats
+            return feats, c_half
 
         if self.with_cp and x.requires_grad:
             return cp.checkpoint(_inner_forward, x)
@@ -346,6 +346,10 @@ class DINOv3_Adapter(nn.Module):
       Output: 4 feature maps at strides {4, 8, 16, 32}.
     * ``'5-level'`` -- 5 levels (1/2, 1/4, 1/8, 1/16, 1/32) all in MSDA.
       Output: 5 feature maps at strides {2, 4, 8, 16, 32}.
+
+    When ``use_stem_skip=True`` (original/4-level only), the stride-2 stem
+    feature is returned as a side output for the decoder's skip connection.
+    This does NOT enter MSDA — it is a lightweight spatial-detail pathway.
 
     NOTE: 5-level mode produces significantly more tokens and requires
     proportionally more GPU memory.
@@ -368,10 +372,12 @@ class DINOv3_Adapter(nn.Module):
         add_vit_feature=True,
         use_extra_extractor=True,
         with_cp=True,
+        use_stem_skip=False,
     ):
         super().__init__()
         assert msda_mode in ("original", "4-level", "5-level")
         self.msda_mode = msda_mode
+        self.use_stem_skip = use_stem_skip and msda_mode != "5-level"
         self.backbone = backbone
         self.backbone.requires_grad_(False)
 
@@ -414,11 +420,21 @@ class DINOv3_Adapter(nn.Module):
             [nn.SyncBatchNorm(embed_dim) for _ in range(n_output_levels)]
         )
 
+        # Stem skip: project raw stem (conv_inplane ch) to embed_dim for decoder
+        if self.use_stem_skip:
+            self.stem_skip_proj = nn.Sequential(
+                nn.Conv2d(conv_inplane, embed_dim, 1, bias=False),
+                nn.SyncBatchNorm(embed_dim),
+                nn.ReLU(inplace=True),
+            )
+
         # -- weight init -------------------------------------------------------
         self.spm.apply(self._init_weights)
         self.interactions.apply(self._init_weights)
         if msda_mode == "original":
             self.up.apply(self._init_weights)
+        if self.use_stem_skip:
+            self.stem_skip_proj.apply(self._init_weights)
         self.apply(self._init_deform_weights)
         nn.init.normal_(self.level_embed)
 
@@ -454,7 +470,12 @@ class DINOv3_Adapter(nn.Module):
         W_toks = w // self.patch_size
 
         # 1) Spatial Prior Module  (list of 4-D spatial tensors, finest first)
-        spm_feats = self.spm(x)
+        spm_feats, c_half_raw = self.spm(x)
+
+        # Capture raw stem 1/2 feature for decoder skip (not in MSDA)
+        stem_skip_feat = None
+        if self.use_stem_skip:
+            stem_skip_feat = self.stem_skip_proj(c_half_raw)  # (B, embed_dim, H/2, W/2)
 
         # 2) Separate bypass (original only) from MSDA-participating levels
         if self.msda_mode == "original":
@@ -527,9 +548,15 @@ class DINOv3_Adapter(nn.Module):
                 )
 
         # 10) Normalize & return as dict keyed by level index
-        return {
+        out = {
             str(i): self.norms[i](feat) for i, feat in enumerate(final_feats)
         }
+
+        # 11) Attach stem skip as side output (not in MSDA feature dict)
+        if self.use_stem_skip:
+            out["stem_skip"] = stem_skip_feat
+
+        return out
 
 
 # ====================================================================
@@ -618,6 +645,10 @@ class DynamicUNetDecoder(nn.Module):
         use_novel_enhancement: enable Periodic Frequency Gating (Part 3).
         periodic_pitch: physical periodic pitch in *original image pixels*.
         finest_stride: stride of the finest adapter feature (4 or 2).
+        use_stem_skip: if True, expect a stride-2 stem skip feature and add
+            an extra decoder stage (stride-4 → stride-2) plus a learned
+            PixelShuffle upsample (stride-2 → stride-1).
+        stem_skip_ch: channel dimension of the stem skip feature.
     """
 
     def __init__(
@@ -629,12 +660,15 @@ class DynamicUNetDecoder(nn.Module):
         use_novel_enhancement=False,
         periodic_pitch=22,
         finest_stride=4,
+        use_stem_skip=False,
+        stem_skip_ch=None,
     ):
         super().__init__()
         n_levels = len(adapter_channels)
         self.use_novel_enhancement = use_novel_enhancement
+        self.use_stem_skip = use_stem_skip
 
-        # Decoder stages (coarsest -> finest)
+        # Decoder stages (coarsest -> finest adapter level)
         self.stages = nn.ModuleList()
         in_ch = adapter_channels[-1]
         for i in range(n_levels - 1):
@@ -646,29 +680,56 @@ class DynamicUNetDecoder(nn.Module):
             )
             in_ch = out_ch
 
+        if use_stem_skip:
+            # Extra stage: finest adapter (stride-4) + stem skip (stride-2) → stride-2
+            if stem_skip_ch is None:
+                stem_skip_ch = adapter_channels[0]
+            stem_out_ch = stem_skip_ch
+            self.stem_stage = DecoderBlock(
+                in_ch, stem_skip_ch, stem_out_ch,
+                use_pixel_shuffle, use_gated_attention,
+            )
+
+            # Learned upsample: stride-2 → stride-1
+            self.final_up = nn.Sequential(
+                nn.Conv2d(stem_out_ch, stem_out_ch * 4, 3, 1, 1, bias=False),
+                nn.PixelShuffle(2),
+                nn.BatchNorm2d(stem_out_ch),
+                nn.ReLU(inplace=True),
+            )
+            head_in_ch = stem_out_ch
+            pfg_stride = 1  # PFG operates at stride-1 now
+        else:
+            head_in_ch = in_ch
+            pfg_stride = finest_stride
+
         # Light conv before head
         self.final_conv = nn.Sequential(
-            nn.Conv2d(in_ch, in_ch, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(in_ch),
+            nn.Conv2d(head_in_ch, head_in_ch, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(head_in_ch),
             nn.ReLU(inplace=True),
         )
 
         if use_novel_enhancement:
             self.pfg = PeriodicFrequencyGating(
-                channels=in_ch,
+                channels=head_in_ch,
                 periodic_pitch_pixels=periodic_pitch,
-                feature_stride=finest_stride,
+                feature_stride=pfg_stride,
             )
 
-        self.head = nn.Conv2d(in_ch, num_classes, 1)
+        self.head = nn.Conv2d(head_in_ch, num_classes, 1)
 
     def forward(self, features, original_size=None):
         """
         Args:
-            features: dict ``{str(i): Tensor}`` or list, finest-first.
+            features: dict ``{str(i): Tensor, 'stem_skip': Tensor}`` or list.
             original_size: ``(H, W)`` of the input image for final upsample.
+                           Ignored when use_stem_skip=True (already at full res).
         """
+        # Extract stem skip if present
+        stem_skip = None
         if isinstance(features, dict):
+            stem_skip = features.pop("stem_skip", None)
             features = [features[str(i)]
                         for i in range(len(features))]
 
@@ -677,14 +738,21 @@ class DynamicUNetDecoder(nn.Module):
             skip = features[-(i + 2)]
             x = stage(x, skip)
 
+        # Stem skip path: stride-4 → stride-2 → stride-1
+        if self.use_stem_skip and stem_skip is not None:
+            x = self.stem_stage(x, stem_skip)           # stride-4 + skip → stride-2
+            x = self.final_up(x)                        # stride-2 → stride-1
+
         x = self.final_conv(x)
 
         if self.use_novel_enhancement:
             x = self.pfg(x)
 
-        if original_size is not None:
-            x = F.interpolate(x, size=original_size, mode="bilinear",
-                              align_corners=False)
+        # Only bilinear upsample if no stem skip (stem skip already at full res)
+        if not (self.use_stem_skip and stem_skip is not None):
+            if original_size is not None:
+                x = F.interpolate(x, size=original_size, mode="bilinear",
+                                  align_corners=False)
 
         return self.head(x)
 
@@ -832,10 +900,21 @@ def build_pipeline(
     use_pixel_shuffle=False,
     use_gated_attention=False,
     use_novel_enhancement=False,
-    periodic_pitch=22,  
+    periodic_pitch=22,
+    use_stem_skip=False,
     backbone=None,
 ):
-    """Convenience builder for the full Adapter -> Decoder pipeline."""
+    """Convenience builder for the full Adapter -> Decoder pipeline.
+
+    Args:
+        use_stem_skip: if True, the adapter exposes a stride-2 stem feature
+            as a side output, and the decoder adds an extra stage
+            (stride-4 → stride-2) plus learned PixelShuffle (stride-2 → stride-1).
+            This gives 4-pixel defects a 4x4 representation at the final
+            feature map instead of ~1 pixel at stride-4.
+            Only effective for 'original' and '4-level' modes (5-level
+            already has stride-2 in MSDA).
+    """
     if backbone is None:
         backbone = _MockDINOv3Backbone(embed_dim=embed_dim, patch_size=patch_size)
 
@@ -847,6 +926,7 @@ def build_pipeline(
         n_points=4,
         deform_num_heads=16,
         with_cp=False,
+        use_stem_skip=use_stem_skip,
     )
 
     n_out = {"original": 4, "4-level": 4, "5-level": 5}[msda_mode]
@@ -860,6 +940,8 @@ def build_pipeline(
         use_novel_enhancement=use_novel_enhancement,
         periodic_pitch=periodic_pitch,
         finest_stride=finest_stride,
+        use_stem_skip=use_stem_skip and msda_mode != "5-level",
+        stem_skip_ch=embed_dim,
     )
 
     return adapter, decoder
@@ -890,8 +972,36 @@ if __name__ == "__main__":
 
         feats = adapter(img)
         print("Adapter outputs:")
-        for k in sorted(feats.keys(), key=int):
+        for k in sorted(feats.keys(), key=lambda k: (not k.isdigit(), k)):
             print(f"  level {k}: {tuple(feats[k].shape)}")
 
         logits = decoder(feats, original_size=(448, 448))
         print(f"Decoder logits: {tuple(logits.shape)}")
+
+    # Test stem_skip mode
+    for mode in ("original", "4-level"):
+        print(f"\n{'='*60}")
+        print(f"  msda_mode = {mode!r} + use_stem_skip=True")
+        print(f"{'='*60}")
+
+        adapter, decoder = build_pipeline(
+            msda_mode=mode,
+            embed_dim=384,
+            num_classes=2,
+            use_pixel_shuffle=True,
+            use_gated_attention=True,
+            use_novel_enhancement=True,
+            periodic_pitch=22,
+            use_stem_skip=True,
+        )
+        adapter = adapter.to(device)
+        decoder = decoder.to(device)
+
+        feats = adapter(img)
+        print("Adapter outputs:")
+        for k in sorted(feats.keys(), key=lambda k: (not k.isdigit(), k)):
+            print(f"  level {k}: {tuple(feats[k].shape)}")
+
+        logits = decoder(feats, original_size=(448, 448))
+        print(f"Decoder logits: {tuple(logits.shape)}")
+        print(f"  -> Full resolution output (no bilinear upsample needed)")
