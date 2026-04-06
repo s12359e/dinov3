@@ -1,0 +1,35 @@
+# ============================================================================
+# DINOv3 SSL Autoresearch — Default Config
+# ============================================================================
+# The AI agent modifies train.py hyperparameters to maximize best_anomaly_score.
+# You can also override any UPPERCASE variable in train.py from this file.
+#
+# Usage:
+#   python train.py --config config.yaml \
+#       --train-dir ../data/sem_defect/images/train \
+#       --eval-dir ../data/sem_defect/images/val
+
+# ── ViT Architecture ────────────────────────────────────────────────────────
+embed_dim: 384            # 384=ViT-S, 768=ViT-B
+depth: 12                 # number of transformer blocks
+num_heads: 6              # attention heads
+patch_size_cfg: 16        # patch size
+drop_path_rate: 0.1       # stochastic depth
+
+# ── SSL Training ────────────────────────────────────────────────────────────
+lr: 1e-4                  # base learning rate
+weight_decay: 0.04        # AdamW weight decay
+warmup_ratio: 0.1         # fraction of time budget for warmup
+batch_size: 32            # images per step (reduce if OOM)
+momentum_teacher: 0.996   # EMA momentum for teacher
+teacher_temp: 0.04        # teacher temperature (lower = sharper)
+student_temp: 0.1         # student temperature
+proj_dim: 256             # projection head output dimension
+proj_hidden: 2048         # projection head hidden dimension
+
+# ── Data Augmentation ───────────────────────────────────────────────────────
+crop_scale_min: 0.4       # global crop min scale
+crop_scale_max: 1.0       # global crop max scale
+flip_prob: 0.5            # horizontal flip probability
+brightness_delta: 20      # brightness jitter range
+# contrast_range: [0.8, 1.2]  # NOTE: tuples not supported in YAML, edit train.py directly

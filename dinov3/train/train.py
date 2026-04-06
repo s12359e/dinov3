@@ -39,6 +39,10 @@ from dinov3.logging import MetricLogger, setup_logging
 from dinov3.train.cosine_lr_scheduler import CosineScheduler, linear_warmup_cosine_decay
 from dinov3.train.multidist_meta_arch import MultiDistillationMetaArch
 from dinov3.train.ssl_meta_arch import SSLMetaArch
+from dinov3.eval.ssl_defect_knn import (
+    evaluate_ssl_defect_knn,
+    parse_defect_coords,
+)
 
 assert torch.__version__ >= (2, 1)
 torch.backends.cuda.matmul.allow_tf32 = True  # pytorch 1.12 sets this to false by default
@@ -91,6 +95,23 @@ For python-based LazyConfig, use "path.key=value".
     parser.add_argument("--record_ref_losses", action="store_true", help="record reference losses")
     parser.add_argument("--ref_losses_path", default="", type=str)
     parser.add_argument("--multi-distillation", action="store_true", help="run multi-distillation")
+
+    # Defect KNN evaluation during SSL training
+    parser.add_argument("--defect-knn-dir", type=str, default="",
+                        help="Directory with defect images (filenames: *_x{X}_y{Y}.png). "
+                             "Enables defect KNN evaluation during SSL training.")
+    parser.add_argument("--defect-knn-k", type=int, nargs="+", default=[5, 10, 20],
+                        help="K values for defect KNN evaluation")
+    parser.add_argument("--defect-knn-period", type=int, default=0,
+                        help="Run defect KNN every N iterations (0 = same as eval_period_iterations)")
+    parser.add_argument("--defect-size", type=int, default=4,
+                        help="Defect bounding box side length in pixels")
+    parser.add_argument("--defect-knn-mean", type=float, nargs=3,
+                        default=[109.65, 104.81, 75.48],
+                        help="Normalization mean (0-255 scale)")
+    parser.add_argument("--defect-knn-std", type=float, nargs=3,
+                        default=[54.32, 39.78, 36.47],
+                        help="Normalization std (0-255 scale)")
 
     return parser
 
@@ -265,6 +286,116 @@ def do_test(cfg, model, iteration, process_group, do_low_freq=False):
         logger.info("Saved eval checkpoint: %s", ckpt_path)
 
 
+def do_defect_knn_eval(model, args, iteration, best_anomaly_score, ckpt_dir, process_subgroup):
+    """Run single-image defect KNN evaluation on the teacher backbone.
+
+    Extracts patch tokens from the EMA teacher backbone, computes
+    per-image anomaly scores (1 - KNN cosine similarity), and saves
+    the best checkpoint when the score improves.
+
+    Args:
+        model: SSLMetaArch with model_ema.backbone.
+        args: parsed CLI args with defect-knn settings.
+        iteration: current training iteration.
+        best_anomaly_score: best score so far (mutable float in a list).
+        ckpt_dir: checkpoint directory.
+        process_subgroup: distributed process group.
+
+    Returns:
+        Updated best_anomaly_score.
+    """
+    if not args.defect_knn_dir or not os.path.isdir(args.defect_knn_dir):
+        return best_anomaly_score
+
+    # Only rank 0 runs evaluation (single-image, no need to distribute)
+    if not distributed.is_subgroup_main_process():
+        if distributed.is_enabled():
+            torch.distributed.barrier()
+        return best_anomaly_score
+
+    logger.info(f"[Defect KNN] Running evaluation at iteration {iteration}...")
+
+    # Extract the teacher backbone (unfrozen copy for inference)
+    teacher_backbone = model.model_ema["backbone"]
+
+    # Get img_size and patch_size from config/model
+    # The teacher backbone should have these attributes
+    if hasattr(teacher_backbone, 'patch_size'):
+        patch_size = teacher_backbone.patch_size
+    else:
+        patch_size = 16  # default for ViT-B/16
+    if hasattr(teacher_backbone, 'img_size'):
+        img_size = teacher_backbone.img_size
+    else:
+        img_size = 512
+
+    device = torch.cuda.current_device()
+
+    results = evaluate_ssl_defect_knn(
+        model=teacher_backbone,
+        data_dir=args.defect_knn_dir,
+        img_size=img_size,
+        patch_size=patch_size,
+        defect_size=args.defect_size,
+        ks=args.defect_knn_k,
+        mean=tuple(args.defect_knn_mean),
+        std=tuple(args.defect_knn_std),
+        device=torch.device(f"cuda:{device}"),
+        output_path=os.path.join(
+            args.output_dir, "eval", f"defect_knn_{iteration}.json"
+        ),
+    )
+
+    if results:
+        current_score = results.get("best_anomaly_score", 0.0)
+        logger.info(
+            f"[Defect KNN] iteration={iteration} | "
+            f"anomaly_score={current_score:.4f} | "
+            f"best_so_far={best_anomaly_score:.4f}"
+        )
+
+        if current_score > best_anomaly_score:
+            best_anomaly_score = current_score
+            logger.info(
+                f"[Defect KNN] New best anomaly score: {best_anomaly_score:.4f} "
+                f"— saving best_defect_knn checkpoint"
+            )
+            # Save the full model checkpoint (not just teacher)
+            best_knn_dir = ckpt_dir / "best_defect_knn"
+            best_knn_dir.mkdir(parents=True, exist_ok=True)
+            # Save teacher weights (for downstream use)
+            new_state_dict = model.model_ema.state_dict()
+            for k, tensor in list(new_state_dict.items()):
+                if isinstance(tensor, DTensor):
+                    new_state_dict[k] = tensor.full_tensor()
+            torch.save(
+                {
+                    "teacher": new_state_dict,
+                    "iteration": iteration,
+                    "best_anomaly_score": best_anomaly_score,
+                    "defect_knn_results": results,
+                },
+                best_knn_dir / "teacher_checkpoint.pth",
+            )
+            logger.info(f"[Defect KNN] Saved best checkpoint: {best_knn_dir / 'teacher_checkpoint.pth'}")
+
+            # Also save a summary file for easy tracking
+            summary_path = os.path.join(args.output_dir, "best_defect_knn_score.json")
+            import json
+            with open(summary_path, "w") as f:
+                json.dump({
+                    "best_anomaly_score": best_anomaly_score,
+                    "iteration": iteration,
+                    "k_values": args.defect_knn_k,
+                    "results": results,
+                }, f, indent=2)
+
+    if distributed.is_enabled():
+        torch.distributed.barrier()
+
+    return best_anomaly_score
+
+
 def build_data_loader_from_cfg(
     cfg,
     model,
@@ -379,7 +510,7 @@ def build_multi_resolution_data_loader_from_cfg(
     return data_loader
 
 
-def do_train(cfg, model, resume=False):
+def do_train(cfg, model, resume=False, args=None):
     process_subgroup = distributed.get_process_subgroup()
     ckpt_dir = Path(cfg.train.output_dir, "ckpt").expanduser()
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -434,6 +565,15 @@ def do_train(cfg, model, resume=False):
     # Manual garbage collection
     gc.disable()
     gc.collect()
+
+    # Defect KNN evaluation state
+    best_anomaly_score = 0.0
+    defect_knn_enabled = args is not None and getattr(args, 'defect_knn_dir', '')
+    defect_knn_period = 0
+    if defect_knn_enabled:
+        defect_knn_period = args.defect_knn_period or cfg.evaluation.eval_period_iterations
+        logger.info(f"[Defect KNN] Enabled — eval every {defect_knn_period} iters, "
+                    f"data_dir={args.defect_knn_dir}")
 
     # Training loop
     student = model.student
@@ -558,6 +698,19 @@ def do_train(cfg, model, resume=False):
             do_test(cfg, model, f"training_{iteration}", process_group=process_subgroup)
             torch.cuda.synchronize()
 
+        # Defect KNN evaluation — saves best checkpoint when anomaly score improves
+        if (
+            defect_knn_enabled
+            and defect_knn_period > 0
+            and (iteration + 1) % defect_knn_period == 0
+        ):
+            best_anomaly_score = do_defect_knn_eval(
+                model, args, iteration, best_anomaly_score,
+                ckpt_dir, process_subgroup,
+            )
+            torch.cuda.synchronize()
+            model.train()
+
         # Checkpointing
         if (iteration + 1) % cfg.checkpointing.period == 0:
             torch.cuda.synchronize()
@@ -630,7 +783,7 @@ def main(argv=None):
             + 1
         )
         return do_test(cfg, model, f"manual_{iteration}")
-    do_train(cfg, model, resume=not args.no_resume)
+    do_train(cfg, model, resume=not args.no_resume, args=args)
 
 
 if __name__ == "__main__":
