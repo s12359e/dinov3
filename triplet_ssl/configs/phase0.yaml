@@ -1,0 +1,3 @@
+# Phase 0 - baseline separability, NO training. Frozen DINOv3 (the bar to beat).
+base: base.yaml
+phase: 0

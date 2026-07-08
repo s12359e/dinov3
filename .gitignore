@@ -20,5 +20,11 @@ dist/
 # Claude Code local settings
 .claude/
 
-# Generated data (re-create via generate_sem_dataset.py)
-data/
+# Generated data (re-create via generate_sem_dataset.py) — root only, NOT triplet_ssl/data/
+/data/
+
+# Checkpoints (mimic via triplet_ssl/make_mimic_checkpoint.py; real weights placed manually)
+/checkpoints/
+
+# Triplet SSL run outputs
+triplet_ssl/runs/

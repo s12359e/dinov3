@@ -1,0 +1,6 @@
+# Phase 2 - defect oversampling (5-20%) + robust top-k exemption on target<->ref.
+base: base.yaml
+phase: 2
+loss:
+  topk_exempt: {enable: true, pct: 0.02}
+oversample: {enable: true, defect_frac: 0.15}

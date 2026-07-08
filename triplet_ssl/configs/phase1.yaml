@@ -1,0 +1,4 @@
+# Phase 1 - Triplet DINO: pairing table + patch loss + shared-geometry views.
+# No defect oversampling, no top-k exemption, no synthetic defects.
+base: base.yaml
+phase: 1

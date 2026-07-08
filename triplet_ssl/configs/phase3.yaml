@@ -1,0 +1,7 @@
+# Phase 3 (optional) - synthetic-defect repulsion, on top of phase 2.
+base: base.yaml
+phase: 3
+loss:
+  topk_exempt: {enable: true, pct: 0.02}
+oversample: {enable: true, defect_frac: 0.15}
+synth_defect: {enable: true, prob: 0.5, lambda: 0.1, types: [cutpaste, line, spot]}

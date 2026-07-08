@@ -1,0 +1,58 @@
+# Shared defaults. Each phaseN.yaml sets `base: base.yaml` and overrides a few keys.
+phase: 1
+
+model:
+  patch_size: 16
+  img_size: 224
+  cls_out_dim: 1024
+  patch_out_dim: 1024
+  head_hidden: 1024
+  head_bottleneck: 128
+  head_nlayers: 2
+
+# Initialise from DINOv3 pretrained weights (mimic until real weights are placed).
+checkpoint: checkpoints/dinov3_vitb16_mimic.pth
+
+data:
+  root: data/sem_triplet
+  train_split: train
+  eval_split: val
+  register: false            # phase-correlation die-to-die pre-registration
+  crop_scale: [0.4, 1.0]
+  flip_prob: 0.5             # horizontal only; vertical flip is forbidden in code
+  brightness_delta: 15
+  contrast_range: [0.9, 1.1]
+  gamma_range: [0.9, 1.1]
+  blur_prob: 0.0
+
+loss:
+  weights: {traditional: 0.3, ref2ref: 0.4, target2ref: 0.3}
+  student_temp: 0.1
+  teacher_temp: 0.04           # warmup start
+  teacher_temp_end: 0.07       # standard DINO: linear 0.04 -> 0.07, then constant
+  teacher_temp_warmup_frac: 0.3
+  center_momentum: 0.9
+  cls_weight: 1.0
+  topk_exempt: {enable: false, pct: 0.02}   # target<->ref only
+
+oversample: {enable: false, defect_frac: 0.1}   # 5-20% defect triplets per batch
+synth_defect: {enable: false, prob: 0.5, lambda: 0.1, types: [cutpaste, line, spot]}
+
+optim:
+  backbone_lr: 1.0e-5        # small: continued pretraining (domain adaptation)
+  head_lr: 1.0e-3            # heads train normally
+  layerwise_decay: 0.9
+  weight_decay: 0.04
+  momentum_teacher: 0.996        # cosine-ramped to momentum_teacher_final
+  momentum_teacher_final: 1.0
+  batch_size: 8
+  num_steps: 60
+  warmup_steps: 10
+  grad_clip: 3.0
+
+eval:
+  overlap_thresh: 0          # patch is "defect" on any GT overlap
+  n_heatmaps: 10
+
+separability_gate: {min_auroc_delta: 0.0}   # must beat the phase-0 baseline
+seed: 0
