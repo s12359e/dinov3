@@ -21,6 +21,13 @@ import torch.utils.checkpoint as cp
 from dinov3.eval.segmentation.models.utils.ms_deform_attn import MSDeformAttn
 
 
+def _get_norm_layer(num_features):
+    """Use SyncBatchNorm when DDP is initialized, otherwise BatchNorm2d."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return nn.SyncBatchNorm(num_features)
+    return nn.BatchNorm2d(num_features)
+
+
 # ====================================================================
 #  Shared Utilities
 # ====================================================================
@@ -282,25 +289,25 @@ class SpatialPriorModule(nn.Module):
         # Split stem so we can intercept the 1/2-resolution feature
         self.stem_conv = nn.Sequential(
             nn.Conv2d(3, inplanes, 3, stride=2, padding=1, bias=False),
-            nn.SyncBatchNorm(inplanes), nn.ReLU(inplace=True),
+            _get_norm_layer(inplanes), nn.ReLU(inplace=True),
             nn.Conv2d(inplanes, inplanes, 3, 1, 1, bias=False),
-            nn.SyncBatchNorm(inplanes), nn.ReLU(inplace=True),
+            _get_norm_layer(inplanes), nn.ReLU(inplace=True),
             nn.Conv2d(inplanes, inplanes, 3, 1, 1, bias=False),
-            nn.SyncBatchNorm(inplanes), nn.ReLU(inplace=True),
+            _get_norm_layer(inplanes), nn.ReLU(inplace=True),
         )
         self.stem_pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
         self.conv2 = nn.Sequential(
             nn.Conv2d(inplanes, 2 * inplanes, 3, stride=2, padding=1, bias=False),
-            nn.SyncBatchNorm(2 * inplanes), nn.ReLU(inplace=True),
+            _get_norm_layer(2 * inplanes), nn.ReLU(inplace=True),
         )
         self.conv3 = nn.Sequential(
             nn.Conv2d(2 * inplanes, 4 * inplanes, 3, stride=2, padding=1, bias=False),
-            nn.SyncBatchNorm(4 * inplanes), nn.ReLU(inplace=True),
+            _get_norm_layer(4 * inplanes), nn.ReLU(inplace=True),
         )
         self.conv4 = nn.Sequential(
             nn.Conv2d(4 * inplanes, 4 * inplanes, 3, stride=2, padding=1, bias=False),
-            nn.SyncBatchNorm(4 * inplanes), nn.ReLU(inplace=True),
+            _get_norm_layer(4 * inplanes), nn.ReLU(inplace=True),
         )
 
         # 1x1 projections to embed_dim
@@ -417,14 +424,14 @@ class DINOv3_Adapter(nn.Module):
             self.up = nn.ConvTranspose2d(embed_dim, embed_dim, 2, 2)
 
         self.norms = nn.ModuleList(
-            [nn.SyncBatchNorm(embed_dim) for _ in range(n_output_levels)]
+            [_get_norm_layer(embed_dim) for _ in range(n_output_levels)]
         )
 
         # Stem skip: project raw stem (conv_inplane ch) to embed_dim for decoder
         if self.use_stem_skip:
             self.stem_skip_proj = nn.Sequential(
                 nn.Conv2d(conv_inplane, embed_dim, 1, bias=False),
-                nn.SyncBatchNorm(embed_dim),
+                _get_norm_layer(embed_dim),
                 nn.ReLU(inplace=True),
             )
 
