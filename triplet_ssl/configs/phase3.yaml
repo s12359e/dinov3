@@ -4,4 +4,4 @@ phase: 3
 loss:
   topk_exempt: {enable: true, pct: 0.02}
 oversample: {enable: true, defect_frac: 0.15}
-synth_defect: {enable: true, prob: 0.5, lambda: 0.1, types: [cutpaste, line, spot]}
+synth_defect: {enable: true, prob: 0.5, lambda: 0.1, types: [psf]}

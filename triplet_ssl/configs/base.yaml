@@ -36,7 +36,13 @@ loss:
   topk_exempt: {enable: false, pct: 0.02}   # target<->ref only
 
 oversample: {enable: false, defect_frac: 0.1}   # 5-20% defect triplets per batch
-synth_defect: {enable: false, prob: 0.5, lambda: 0.1, types: [cutpaste, line, spot]}
+synth_defect:
+  enable: false
+  prob: 0.5
+  lambda: 0.1
+  types: [psf]                 # optical PSF blob; legacy: cutpaste, line, spot
+  psf_sigma: [1.1, 1.7]        # footprint (>20% peak) ~ 3.6*sigma = 4.0-6.1 px
+  psf_amplitude: [15, 80]      # gray levels, nuisance-level to obvious; sign random
 
 optim:
   backbone_lr: 1.0e-5        # small: continued pretraining (domain adaptation)

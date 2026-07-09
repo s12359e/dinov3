@@ -71,14 +71,24 @@ class TripletLoss(nn.Module):
         return _ce_lastdim(s_logits, t, self.student_temp)  # (B, N)
 
     @staticmethod
-    def _robust_mean(loss_bn, pct):
-        """Mean over patches after dropping the top-`pct` fraction per image."""
+    def _robust_mean(loss_bn, pct, exclude_mask=None):
+        """Mean over patches after dropping the top-`pct` fraction per image.
+
+        `exclude_mask` (B,N, truthy = exclude) removes patches from the mean
+        entirely -- known synthetic-defect patches must never be pulled toward
+        the reference. Excluded patches also don't consume top-k slots (they are
+        masked to -inf before the top-k selection), so the k exemptions remain
+        available for real defects."""
         B, N = loss_bn.shape
+        keep = torch.ones_like(loss_bn, dtype=torch.bool)
+        if exclude_mask is not None:
+            keep &= ~exclude_mask.bool()
         k = int(N * pct)
-        if k <= 0:
-            return loss_bn.mean()
-        vals, _ = loss_bn.sort(dim=1)          # ascending
-        return vals[:, : N - k].mean()
+        if k > 0:
+            masked = loss_bn.masked_fill(~keep, float("-inf"))
+            topk_idx = masked.topk(k, dim=1).indices
+            keep.scatter_(1, topk_idx, False)
+        return (loss_bn * keep).sum() / keep.sum().clamp(min=1)
 
     def forward(self, cls, patch, trad_key="target", synth_mask=None):
         """cls[name] / patch[name] = dict(s=student_logits, t=teacher_logits).
@@ -98,7 +108,9 @@ class TripletLoss(nn.Module):
         # 2. target-ref : robust top-k exemption on the patch term -------------
         tr_pp = 0.5 * (self._patch_per_patch(patch["target"]["s"], patch["ref1"]["t"])
                        + self._patch_per_patch(patch["target"]["s"], patch["ref2"]["t"]))  # (B,N)
-        tr_patch = self._robust_mean(tr_pp, self.topk_pct)
+        # Known synthetic-defect patches are excluded from the pull (mask-certain),
+        # on top of the statistical top-k exemption for unlabeled real defects.
+        tr_patch = self._robust_mean(tr_pp, self.topk_pct, exclude_mask=synth_mask)
         tr_cls = 0.5 * (self._cls_pair(cls["target"]["s"], cls["ref1"]["t"])
                         + self._cls_pair(cls["target"]["s"], cls["ref2"]["t"]))
         L_tr = tr_patch + self.cls_weight * tr_cls

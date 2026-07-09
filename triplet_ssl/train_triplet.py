@@ -204,8 +204,11 @@ def main():
                                flip_prob=dc["flip_prob"], brightness_delta=dc["brightness_delta"],
                                contrast_range=tuple(dc["contrast_range"]),
                                gamma_range=tuple(dc["gamma_range"]), blur_prob=dc["blur_prob"])
-    synth = SyntheticDefect(prob=cfg["synth_defect"]["prob"], types=tuple(cfg["synth_defect"]["types"]),
-                            seed=cfg["seed"]) if cfg["synth_defect"]["enable"] else None
+    sd = cfg["synth_defect"]
+    synth = SyntheticDefect(prob=sd["prob"], types=tuple(sd["types"]),
+                            psf_sigma=tuple(sd.get("psf_sigma", (1.0, 1.7))),
+                            psf_amplitude=tuple(sd.get("psf_amplitude", (15, 80))),
+                            seed=cfg["seed"]) if sd["enable"] else None
     train_ds = TripletDataset(dc["root"], dc["train_split"], transform=aug,
                               register=dc["register"], patch_size=patch_size,
                               load_masks=False, synth_defect=synth)
