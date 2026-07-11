@@ -235,8 +235,11 @@ def main():
         train_ds, batch_size=bs,
         defect_frac=oc["defect_frac"] if oc["enable"] else None,
         num_batches=cfg["optim"]["num_steps"], seed=cfg["seed"])
+    nw = dc.get("num_workers", 0)
     loader = torch.utils.data.DataLoader(train_ds, batch_sampler=sampler,
-                                         num_workers=0, collate_fn=triplet_collate)
+                                         num_workers=nw, collate_fn=triplet_collate,
+                                         pin_memory=(device.type == "cuda"),
+                                         persistent_workers=(nw > 0))
 
     # -- Optimizer -----------------------------------------------------------
     groups = param_groups_layerwise(student_bb, [s_cls, s_patch],
@@ -265,24 +268,37 @@ def main():
         # Cosine EMA momentum ramp mom0 -> mom_final (stock DINO recipe).
         mom = mom_final - (mom_final - mom0) * (math.cos(math.pi * step / max(total, 1)) + 1) / 2
 
-        s_views = {n: batch[n][:, 0].to(device) for n in NAMES}
-        t_views = {n: batch[n][:, 1].to(device) for n in NAMES}
+        # Batched forwards (GPU-friendly): the three same-size views are stacked
+        # into one (3B, ...) pass -- 9 forwards/step become 3. ViT uses LayerNorm
+        # (per-sample stats), so this is numerically identical to per-view calls.
         # iBOT-style split with DINO's asymmetry direction: patch loss on the
-        # aligned native views; when the dataset provides local CLS views, the
-        # STUDENT's CLS side comes from the small local window (local-to-global
-        # prediction, with grad) while the TEACHER only ever sees the full
-        # native crop (stable, complete targets).
+        # aligned native views; STUDENT's CLS side comes from the small local
+        # window (local-to-global, with grad) while the TEACHER only ever sees
+        # the full native crop (stable, complete targets).
+        B = batch["ref1"].shape[0]
         has_cls_views = "target_cls" in batch
+        s_nat = torch.cat([batch[n][:, 0] for n in NAMES]).to(device, non_blocking=True)
+        t_nat = torch.cat([batch[n][:, 1] for n in NAMES]).to(device, non_blocking=True)
+
+        if has_cls_views:
+            s_loc = torch.cat([batch[n + "_cls"] for n in NAMES]).to(device, non_blocking=True)
+            # Both student resolutions in ONE call via the stock DINO multi-crop
+            # path (forward_features_list); heads applied selectively (patch head
+            # only on natives, CLS head only on locals) -- no wasted compute.
+            f_nat, f_loc = student_bb.forward_features([s_nat, s_loc],
+                                                       masks=[None, None])
+            ps_nat = s_patch(f_nat["x_norm_patchtokens"])
+            cs_all = s_cls(f_loc["x_norm_clstoken"])
+        else:
+            cs_all, ps_nat = embed(student_bb, s_cls, s_patch, s_nat)
+        with torch.no_grad():
+            ct_nat, pt_nat = embed(teacher_bb, t_cls, t_patch, t_nat)
+
         cls, patch = {}, {}
-        for n in NAMES:
-            cs, ps = embed(student_bb, s_cls, s_patch, s_views[n])
-            if has_cls_views:
-                cs, _ = embed(student_bb, s_cls, s_patch,
-                              batch[n + "_cls"].to(device))
-            with torch.no_grad():
-                ct, pt = embed(teacher_bb, t_cls, t_patch, t_views[n])
-            cls[n] = dict(s=cs, t=ct.detach())
-            patch[n] = dict(s=ps, t=pt.detach())
+        for i, n in enumerate(NAMES):
+            sl = slice(i * B, (i + 1) * B)
+            cls[n] = dict(s=cs_all[sl], t=ct_nat[sl].detach())
+            patch[n] = dict(s=ps_nat[sl], t=pt_nat[sl].detach())
 
         synth_mask = batch["synth_mask"].to(device) if "synth_mask" in batch else None
         # TR-CLS exemption: target KNOWN to contain a defect (image-level flag or

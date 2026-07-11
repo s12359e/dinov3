@@ -17,6 +17,7 @@ data:
   root: data/sem_triplet
   train_split: train
   eval_split: val
+  num_workers: 0             # dataloader workers(GPU 訓練時建議 2-4,撒點/對位不卡 GPU)
   register: false            # phase-correlation die-to-die pre-registration
   crop_scale: [0.4, 1.0]
   flip_prob: 0.5             # horizontal only; vertical flip is forbidden in code
