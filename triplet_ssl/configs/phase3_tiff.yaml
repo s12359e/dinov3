@@ -1,0 +1,18 @@
+# TIFF 3 通道模式範例:一個 .tif = 一個 pattern 位置,
+# ch1 = target, ch2 = ref1, ch3 = ref2(uint8 或 uint16、channels-last 或 3-page 皆可)。
+# 流程:原生解析度 128x128 視窗裁切(不 resize)→ 裁切後 on-the-fly 貼 PSF 事件。
+base: base.yaml
+phase: 3
+data:
+  format: tiff3
+  root: data/tiff_train            # 放 .tif/.tiff 的目錄
+  eval_root: data/sem_triplet      # 可選:folder 格式 eval 集(有 GT mask);拿掉則跳過 eval
+  crop_size: 128
+  cls_local_size: 64   # student 的 CLS local 視圖(原生尺度、不 resize;16 的倍數)。null = 關閉
+loss:
+  topk_exempt: {enable: true, pct: 0.02}   # 128px -> 64 patches, 2% = 1 patch
+oversample: {enable: false}        # tiff 模式沒有真缺陷旗標,關閉
+# defect_center_jitter 22 + footprint ~7 < 64/2 → center-64 crop 保證含 defect,
+# 且位置有 ±22px 變化,避免「中心 patch = 缺陷」的位置捷徑
+synth_defect: {enable: true, n_events: [2, 5], defect_prob: 0.5, lambda: 0.1,
+               defect_center_jitter: 22}

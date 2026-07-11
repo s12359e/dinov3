@@ -180,12 +180,15 @@ class TripletDataset(Dataset):
             target, ot = coarse_register(ref1, target, self.max_shift_assert)
             self.offset_log.append((o2, ot))
 
-        # Phase-3 synthetic defect injected BEFORE the crop; its pixel mask rides the
-        # SAME geometric transform, so patch alignment holds AND the survival check is
-        # meaningful (the defect can genuinely be cropped out).
+        # Phase-3 synthetic PSF events injected AFTER registration, BEFORE the crop:
+        # nuisance combos scattered across all three dies + optional true (1,0,0)
+        # defect on target. Only the defect's pixel mask comes back; it rides the
+        # SAME geometric transform, so patch alignment holds AND the survival check
+        # is meaningful (the defect can genuinely be cropped out).
         pix_mask = None
         if self.synth_defect is not None:
-            target, pix_mask = self.synth_defect(target, is_defect=m["has_defect"])
+            ref1, ref2, target, pix_mask = self.synth_defect(
+                ref1, ref2, target, is_defect=m["has_defect"])
 
         # Shared geometric crop (sampled once) applied to all three.
         h, w = ref1.shape[:2]
@@ -217,6 +220,136 @@ class TripletDataset(Dataset):
         return sample
 
 
+class TiffTripletDataset(Dataset):
+    """One 3-channel TIFF per pattern location: ch0=target, ch1=ref1, ch2=ref2.
+
+    Flow (per the user's training recipe):
+      TIFF -> split channels -> [optional target-anchored sub-pixel registration]
+           -> shared 128x128 window crop at NATIVE resolution (no resize -- a 4-6px
+              PSF defect survives) + shared h-flip
+           -> on-the-fly TripletSyntheticPSF injection ON THE CROP
+           -> independent photometric x2 per image.
+
+    No manifest / GT needed: all triplets are treated as normal; the defect signal
+    comes entirely from synthetic (1,0,0) events. Supports uint8 / uint16 TIFFs and
+    both channels-last and 3-page layouts.
+    """
+
+    def __init__(self, root, crop_size=128, transform=None, register=False,
+                 patch_size=16, synth_defect=None, channel_order=(0, 1, 2),
+                 cls_local_size=64):
+        self.files = sorted(list(Path(root).glob("*.tif")) + list(Path(root).glob("*.tiff")))
+        if not self.files:
+            raise FileNotFoundError(f"no .tif/.tiff in {root}")
+        self.crop = crop_size
+        self.transform = transform
+        self.register = register
+        self.patch_size = patch_size
+        self.max_shift_assert = patch_size / 2.0
+        self.synth_defect = synth_defect
+        self.channel_order = channel_order   # (target, ref1, ref2) channel indices
+        if cls_local_size is not None:
+            assert cls_local_size % patch_size == 0 and cls_local_size < crop_size
+        self.cls_local_size = cls_local_size  # student-side local CLS view (no resize)
+        self.load_masks = False              # no GT anywhere in this dataset
+        self.defect_idx = []                 # real-defect flags unknown -> all "normal"
+        self.normal_idx = list(range(len(self.files)))
+        self.offset_log = []
+
+    def __len__(self):
+        return len(self.files)
+
+    def assert_no_masks(self):
+        assert not self.load_masks, "GT masks must not be loaded in the training path"
+
+    def _read_tiff(self, path):
+        from PIL import Image
+        img = Image.open(path)
+        arr = np.array(img)
+        if arr.ndim == 2 and getattr(img, "n_frames", 1) >= 3:   # 3-page layout
+            chans = []
+            for i in range(3):
+                img.seek(i)
+                chans.append(np.array(img))
+            arr = np.stack(chans, axis=-1)
+        if arr.ndim != 3 or arr.shape[2] < 3:
+            raise ValueError(f"{path}: expected 3-channel TIFF, got shape {arr.shape}")
+        if arr.dtype == np.uint16:
+            arr = (arr / 256).astype(np.uint8)
+        elif arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        # each channel -> grayscale replicated to 3ch (ViT input convention)
+        co = self.channel_order
+        to3 = lambda c: np.repeat(arr[:, :, c:c + 1], 3, axis=2)
+        return to3(co[0]), to3(co[1]), to3(co[2])   # target, ref1, ref2
+
+    def __getitem__(self, idx):
+        path = self.files[idx]
+        target, ref1, ref2 = self._read_tiff(path)
+
+        # Registration BEFORE crop, anchored on TARGET (target never warped, so any
+        # defect coordinates stay put; refs are warped onto it).
+        if self.register:
+            ref1, o1 = coarse_register(target, ref1, self.max_shift_assert)
+            ref2, o2 = coarse_register(target, ref2, self.max_shift_assert)
+            self.offset_log.append((o1, o2))
+
+        # Shared native-resolution window crop + shared h-flip (no resize).
+        h, w = target.shape[:2]
+        c = self.crop
+        top = np.random.randint(0, max(h - c, 0) + 1)
+        left = np.random.randint(0, max(w - c, 0) + 1)
+        flip = np.random.random() < 0.5
+        def cut(img):
+            win = img[top:top + c, left:left + c]
+            return np.ascontiguousarray(np.fliplr(win)) if flip else win.copy()
+        tgt_c, r1_c, r2_c = cut(target), cut(ref1), cut(ref2)
+
+        # On-the-fly synthetic PSF events ON THE CROP (user's recipe: crop then paste).
+        pix_mask = None
+        if self.synth_defect is not None:
+            r1_c, r2_c, tgt_c, pix_mask = self.synth_defect(r1_c, r2_c, tgt_c,
+                                                            is_defect=False)
+        synth_patch_mask = None
+        if self.synth_defect is not None:
+            if pix_mask is not None:
+                g = c // self.patch_size
+                m = pix_mask[: g * self.patch_size, : g * self.patch_size]
+                m = m.reshape(g, self.patch_size, g, self.patch_size).max(axis=(1, 3))
+                synth_patch_mask = (m > 0).astype(np.float32).reshape(-1)
+            else:
+                synth_patch_mask = np.zeros((c // self.patch_size) ** 2, np.float32)
+
+        def views(img):   # two independent photometric variants (student, teacher)
+            return torch.stack([self.transform.photometric(img),
+                                self.transform.photometric(img)])
+
+        sample = dict(ref1=views(r1_c), ref2=views(r2_c), target=views(tgt_c),
+                      is_defect=False, id=path.stem)
+
+        # CLS local views, DINO-style asymmetry in the CORRECT direction:
+        # STUDENT sees a small local sub-window (varied / partial context),
+        # TEACHER sees only the full native crop (stable, complete target)
+        # -> local-to-global prediction, targets computed from full context.
+        # No resize anywhere: the sub-window is fed at native scale (e.g. 64px
+        # -> 4x4 tokens, cheap). Location shared across the triplet (same
+        # physical site on every die); photometric independent per image.
+        if self.cls_local_size is not None:
+            # CENTER crop: together with the injector's center-jittered defect
+            # placement this guarantees the local view always contains the pasted
+            # defect (jitter + footprint < ls/2).
+            ls = self.cls_local_size
+            lt = ll = (c - ls) // 2
+            for name, img in (("ref1", r1_c), ("ref2", r2_c), ("target", tgt_c)):
+                win = np.ascontiguousarray(img[lt:lt + ls, ll:ll + ls])
+                sample[name + "_cls"] = self.transform.photometric(win)
+
+        if synth_patch_mask is not None:
+            sample["synth_mask"] = torch.from_numpy(synth_patch_mask).float()
+            sample["synth_injected"] = pix_mask is not None
+        return sample
+
+
 def triplet_collate(batch):
     out = dict(
         ref1=torch.stack([b["ref1"] for b in batch]),
@@ -227,6 +360,9 @@ def triplet_collate(batch):
     )
     if "synth_mask" in batch[0]:
         out["synth_mask"] = torch.stack([b["synth_mask"] for b in batch])
+    for k in ("ref1_cls", "ref2_cls", "target_cls"):
+        if k in batch[0]:
+            out[k] = torch.stack([b[k] for b in batch])
     return out
 
 

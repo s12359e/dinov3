@@ -142,6 +142,14 @@ $OUT = "triplet_ssl\runs\exp1"
 | t(ref1\|ref2)↔s(target) | `w_target2ref=0.3` | **是**(缺陷 patch 本來就不該匹配參考)|
 | 同圖兩增強(輪替 t/r1/r2)| `w_traditional=0.3` | 否 |
 
+**Phase 3 合成 PSF 事件(排列組合放置)**:每 triplet 撒 `n_events` 顆 nuisance
+PSF 點,presence 組合 (target, ref1, ref2) 隨機取自六種非 defect 組合、位置跨
+die 共享;另以 `defect_prob` 在無真缺陷的 triplet 上放**一顆 (1,0,0) 真 defect**
+(target 有、兩 ref 都沒有,位置避開 nuisance)。只有 (1,0,0) 進 loss mask
+(排除 pull + repel);其餘組合刻意不標,交給配對 loss 自然處理——**不對稱本身
+就是教材**:模型必須學會「有 blob 不是異常,ref 找不到對應的 blob 才是」。
+極性依局部背景決定(亮區放暗點、暗區放亮點,防 clip 飽和)。
+
 穩定化照 stock DINO:EMA teacher(momentum 0.996→1.0 cosine)、centering、
 teacher temp 0.04→0.07 warmup、cosine LR + warmup。backbone LR 小(1e-5,
 layer-wise decay 0.9),head LR 正常(1e-3)。
@@ -188,12 +196,12 @@ layer-wise decay 0.9),head LR 正常(1e-3)。
 
 1. **縮圖問題(P0,未修)**:增強與 eval 的 resize 會毀掉 4–6 px 缺陷,
    原圖 > `img_size` 時必須先改成原生解析度裁切。
-2. **合成缺陷形貌(P0,未修)**:`synth_defect.py` 目前是硬邊方塊/線條,
-   與 PSF 光斑不符;真的要用 Phase 3 前應改成低對比 Gaussian blob(σ≈0.8–1.5)。
-3. **top-k 是百分比**:224px 時 2% = 3 patches,剛好 ≈ 一顆 PSF 缺陷;
+2. **top-k 是百分比**:224px 時 2% = 3 patches,剛好 ≈ 一顆 PSF 缺陷;
    換解析度時記得重估(512px 時 2% = 20 patches,豁免過頭)。
-4. Sinkhorn 未用(dinov3 版綁 distributed),以 centering 取代 —
+3. Sinkhorn 未用(dinov3 版綁 distributed),以 centering 取代 —
    單機/CPU 可跑;多卡要 Sinkhorn 時再換。
+4. **Eval 端尚無對位**:`register` 只作用於訓練路徑;真資料有偏移時
+   eval 殘差會被錯位邊緣汙染,需在 eval 加同一套對位。
 
 ## 常見問題
 

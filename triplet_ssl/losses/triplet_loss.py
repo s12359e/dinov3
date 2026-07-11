@@ -66,6 +66,10 @@ class TripletLoss(nn.Module):
         t = self._sharpen_cls(t_logits)
         return _ce_lastdim(s_logits, t, self.student_temp).mean()
 
+    def _cls_pair_per_sample(self, s_logits, t_logits):
+        t = self._sharpen_cls(t_logits)
+        return _ce_lastdim(s_logits, t, self.student_temp)  # (B,)
+
     def _patch_per_patch(self, s_logits, t_logits):
         t = self._sharpen_patch(t_logits)
         return _ce_lastdim(s_logits, t, self.student_temp)  # (B, N)
@@ -90,10 +94,16 @@ class TripletLoss(nn.Module):
             keep.scatter_(1, topk_idx, False)
         return (loss_bn * keep).sum() / keep.sum().clamp(min=1)
 
-    def forward(self, cls, patch, trad_key="target", synth_mask=None):
+    def forward(self, cls, patch, trad_key="target", synth_mask=None,
+                cls_exempt=None):
         """cls[name] / patch[name] = dict(s=student_logits, t=teacher_logits).
 
         name in {ref1, ref2, target}. cls logits (B,Kc); patch logits (B,N,Kp).
+        cls_exempt: optional (B,) bool -- samples whose target is KNOWN to contain
+        a defect (synthetic injection or has_defect flag). Their target<->ref CLS
+        term is dropped entirely: pulling a defect-bearing global feature toward a
+        defect-free reference is CLS-level normality collapse. RR/TD CLS are
+        unaffected (refs are clean; the same-image pair is consistent either way).
         Returns (total_loss, log_dict).
         """
         logs = {}
@@ -111,8 +121,13 @@ class TripletLoss(nn.Module):
         # Known synthetic-defect patches are excluded from the pull (mask-certain),
         # on top of the statistical top-k exemption for unlabeled real defects.
         tr_patch = self._robust_mean(tr_pp, self.topk_pct, exclude_mask=synth_mask)
-        tr_cls = 0.5 * (self._cls_pair(cls["target"]["s"], cls["ref1"]["t"])
-                        + self._cls_pair(cls["target"]["s"], cls["ref2"]["t"]))
+        tr_cls_ps = 0.5 * (self._cls_pair_per_sample(cls["target"]["s"], cls["ref1"]["t"])
+                           + self._cls_pair_per_sample(cls["target"]["s"], cls["ref2"]["t"]))
+        if cls_exempt is not None and cls_exempt.any():
+            keep = ~cls_exempt.bool()
+            tr_cls = tr_cls_ps[keep].mean() if keep.any() else tr_cls_ps.sum() * 0.0
+        else:
+            tr_cls = tr_cls_ps.mean()
         L_tr = tr_patch + self.cls_weight * tr_cls
 
         # 3. traditional same-image pair (rotating) ----------------------------
@@ -139,6 +154,8 @@ class TripletLoss(nn.Module):
         logs.update(L_refref=float(L_rr.detach()), L_target2ref=float(L_tr.detach()),
                     L_trad=float(L_td.detach()),
                     exempt_pct=self.topk_pct)
+        if cls_exempt is not None:
+            logs["n_cls_exempt"] = int(cls_exempt.sum())
         return total, logs
 
     @torch.no_grad()

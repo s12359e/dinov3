@@ -38,11 +38,11 @@ loss:
 oversample: {enable: false, defect_frac: 0.1}   # 5-20% defect triplets per batch
 synth_defect:
   enable: false
-  prob: 0.5
+  n_events: [3, 8]             # nuisance PSF points per triplet, random presence combos
+  defect_prob: 0.5             # chance of ONE true (target-only) defect on normal triplets
   lambda: 0.1
-  types: [psf]                 # optical PSF blob; legacy: cutpaste, line, spot
   psf_sigma: [1.1, 1.7]        # footprint (>20% peak) ~ 3.6*sigma = 4.0-6.1 px
-  psf_amplitude: [15, 80]      # gray levels, nuisance-level to obvious; sign random
+  psf_amplitude: [15, 80]      # gray levels; polarity is local-background-aware
 
 optim:
   backbone_lr: 1.0e-5        # small: continued pretraining (domain adaptation)

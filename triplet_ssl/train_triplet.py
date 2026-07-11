@@ -33,8 +33,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dinov3.models.vision_transformer import vit_base
 from dinov3.layers.dino_head import DINOHead
 from triplet_ssl.data.triplet_dataset import (
-    TripletDataset, SharedGeomTripletAug, DefectOversampleBatchSampler, triplet_collate)
-from triplet_ssl.data.synth_defect import SyntheticDefect, augmentation_survival_check
+    TripletDataset, TiffTripletDataset, SharedGeomTripletAug,
+    DefectOversampleBatchSampler, triplet_collate)
+from triplet_ssl.data.synth_defect import TripletSyntheticPSF, augmentation_survival_check
 from triplet_ssl.losses.triplet_loss import TripletLoss
 from triplet_ssl.eval.separability import evaluate_separability, evaluate_guardrail
 from triplet_ssl.eval.plot_curves import plot_training_curves
@@ -58,10 +59,10 @@ def _deep_merge(base, over):
 
 def load_config(path):
     path = Path(path)
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     if "base" in cfg:
-        with open(path.parent / cfg["base"]) as f:
+        with open(path.parent / cfg["base"], encoding="utf-8") as f:
             base = yaml.safe_load(f)
         cfg = _deep_merge(base, {k: v for k, v in cfg.items() if k != "base"})
     return cfg
@@ -205,15 +206,26 @@ def main():
                                contrast_range=tuple(dc["contrast_range"]),
                                gamma_range=tuple(dc["gamma_range"]), blur_prob=dc["blur_prob"])
     sd = cfg["synth_defect"]
-    synth = SyntheticDefect(prob=sd["prob"], types=tuple(sd["types"]),
-                            psf_sigma=tuple(sd.get("psf_sigma", (1.0, 1.7))),
-                            psf_amplitude=tuple(sd.get("psf_amplitude", (15, 80))),
-                            seed=cfg["seed"]) if sd["enable"] else None
-    train_ds = TripletDataset(dc["root"], dc["train_split"], transform=aug,
-                              register=dc["register"], patch_size=patch_size,
-                              load_masks=False, synth_defect=synth)
+    synth = TripletSyntheticPSF(
+        n_events=tuple(sd.get("n_events", (3, 8))),
+        defect_prob=sd.get("defect_prob", 0.5),
+        psf_sigma=tuple(sd.get("psf_sigma", (1.1, 1.7))),
+        psf_amplitude=tuple(sd.get("psf_amplitude", (15, 80))),
+        defect_center_jitter=sd.get("defect_center_jitter"),
+        seed=cfg["seed"]) if sd["enable"] else None
+    if dc.get("format", "folder") == "tiff3":
+        train_ds = TiffTripletDataset(dc["root"], crop_size=dc.get("crop_size", 128),
+                                      transform=aug, register=dc["register"],
+                                      patch_size=patch_size, synth_defect=synth,
+                                      cls_local_size=dc.get("cls_local_size", 64))
+        print(f"[data] tiff3: {len(train_ds)} TIFFs, native {dc.get('crop_size', 128)}px "
+              f"window crop (no resize)")
+    else:
+        train_ds = TripletDataset(dc["root"], dc["train_split"], transform=aug,
+                                  register=dc["register"], patch_size=patch_size,
+                                  load_masks=False, synth_defect=synth)
+        print(f"[data] {len(train_ds)} triplets ({len(train_ds.defect_idx)} defective)")
     train_ds.assert_no_masks()
-    print(f"[data] {len(train_ds)} triplets ({len(train_ds.defect_idx)} defective)")
     if synth is not None:
         augmentation_survival_check(train_ds, n=min(100, len(train_ds)))
 
@@ -255,16 +267,31 @@ def main():
 
         s_views = {n: batch[n][:, 0].to(device) for n in NAMES}
         t_views = {n: batch[n][:, 1].to(device) for n in NAMES}
+        # iBOT-style split with DINO's asymmetry direction: patch loss on the
+        # aligned native views; when the dataset provides local CLS views, the
+        # STUDENT's CLS side comes from the small local window (local-to-global
+        # prediction, with grad) while the TEACHER only ever sees the full
+        # native crop (stable, complete targets).
+        has_cls_views = "target_cls" in batch
         cls, patch = {}, {}
         for n in NAMES:
             cs, ps = embed(student_bb, s_cls, s_patch, s_views[n])
+            if has_cls_views:
+                cs, _ = embed(student_bb, s_cls, s_patch,
+                              batch[n + "_cls"].to(device))
             with torch.no_grad():
                 ct, pt = embed(teacher_bb, t_cls, t_patch, t_views[n])
             cls[n] = dict(s=cs, t=ct.detach())
             patch[n] = dict(s=ps, t=pt.detach())
 
         synth_mask = batch["synth_mask"].to(device) if "synth_mask" in batch else None
-        loss, logs = triplet_loss(cls, patch, trad_key=NAMES[step % 3], synth_mask=synth_mask)
+        # TR-CLS exemption: target KNOWN to contain a defect (image-level flag or
+        # synthetic injection) -> drop that sample's target<->ref CLS pull.
+        cls_exempt = batch["is_defect"].to(device).bool()
+        if synth_mask is not None:
+            cls_exempt = cls_exempt | (synth_mask.sum(dim=1) > 0)
+        loss, logs = triplet_loss(cls, patch, trad_key=NAMES[step % 3],
+                                  synth_mask=synth_mask, cls_exempt=cls_exempt)
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -347,12 +374,18 @@ def _log_exempt_overlays(loss_mod, student_bb, s_cls, s_patch, teacher_bb, t_cls
 
 def _evaluate_and_report(backbone, cfg, device, out_dir, phase, notes=""):
     dc, ec, mc = cfg["data"], cfg["eval"], cfg["model"]
+    eval_root = dc.get("eval_root") or dc["root"]
+    if dc.get("format", "folder") == "tiff3" and not dc.get("eval_root"):
+        print("[eval] skipped: tiff3 data has no GT masks. Set data.eval_root to a "
+              "folder-format eval split (<id>/{ref1,ref2,target,mask}.png + manifest) "
+              "to enable the separability gate.")
+        return
     metrics = evaluate_separability(
-        backbone, dc["root"], dc["eval_split"], device,
+        backbone, eval_root, dc["eval_split"], device,
         img_size=mc["img_size"], patch_size=mc["patch_size"],
         overlap_thresh=ec["overlap_thresh"], n_heatmaps=ec["n_heatmaps"],
         out_dir=str(out_dir / f"phase{phase}_heatmaps"), tag=f"phase{phase}")
-    guard = evaluate_guardrail(backbone, dc["root"], dc["eval_split"], device,
+    guard = evaluate_guardrail(backbone, eval_root, dc["eval_split"], device,
                                img_size=mc["img_size"])
     metrics.update(guard)
 
