@@ -125,6 +125,24 @@ $OUT = "triplet_ssl\runs\exp1"
 
 ---
 
+## 多 GPU(torchrun,例:2×H200 大 batch)
+
+```bash
+torchrun --nproc_per_node=2 triplet_ssl/train_triplet.py \
+    --config triplet_ssl/configs/phase3_tiff.yaml \
+    --out-dir triplet_ssl/runs/exp_h200 --checkpoint <真權重.pth>
+```
+
+- `optim.batch_size` 是**每卡** batch;global = batch_size × 卡數。大 global batch 時
+  依線性法則手動放大 LR(`lr_eff = lr × global_batch / 調參時的 batch`)。
+- `optim.amp: true` 開 bf16 autocast(H100/H200 建議)。
+- `data.num_workers: 4` 左右,讓撒點/對位不卡 GPU。
+- 機制:student 包在單一 forward 的容器裡進 DDP;teacher 每卡各持一份(EMA 自
+  同步的 student 而來,天然一致);centering 跨卡 all-reduce;每卡不同 seed 取
+  不同 batch;eval / 存檔 / 曲線只在 rank 0。
+- Windows 的 torch build 缺 libuv 與 gloo transport,多程序只能在 Linux 跑;
+  `DDP_INIT_FILE` 環境變數是 FileStore 逃生口(除錯用)。
+
 ## Phase 說明
 
 | Phase | 內容 | 開啟的 flag |

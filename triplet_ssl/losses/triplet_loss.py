@@ -20,6 +20,7 @@ target-ref patch term -- actively pushes synthetic-defect patches away from the 
 """
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -57,8 +58,13 @@ class TripletLoss(nn.Module):
     @torch.no_grad()
     def _update_centers(self, cls_logits, patch_logits):
         bc = cls_logits.mean(dim=0, keepdim=True)
-        self.center_cls.mul_(self.center_momentum).add_(bc, alpha=1 - self.center_momentum)
         bp = patch_logits.mean(dim=(0, 1), keepdim=True)
+        # DDP: centers must stay identical on every rank, so the batch mean is
+        # all-reduced across ranks (stock DINO does the same).
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(bc); bc /= dist.get_world_size()
+            dist.all_reduce(bp); bp /= dist.get_world_size()
+        self.center_cls.mul_(self.center_momentum).add_(bc, alpha=1 - self.center_momentum)
         self.center_patch.mul_(self.center_momentum).add_(bp, alpha=1 - self.center_momentum)
 
     # -- pair losses -------------------------------------------------------- #

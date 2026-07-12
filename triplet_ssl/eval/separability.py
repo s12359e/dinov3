@@ -70,6 +70,20 @@ def _patch_tokens(backbone, x):
     return F.normalize(tok, dim=-1)
 
 
+def _residual(tg, r1, r2, mode="mean"):
+    """Per-patch residual of target vs the two refs.
+
+    mean: ||f(t) - (f(r1)+f(r2))/2||  -- lowest noise when both refs are clean.
+    min : min(||f(t)-f(r1)||, ||f(t)-f(r2)||) -- classic double detection:
+          target only needs to match ONE ref, so a defect/nuisance present in a
+          single ref cannot raise the score (robust to dirty refs).
+    """
+    if mode == "min":
+        return torch.minimum(torch.norm(tg - r1, dim=-1),
+                             torch.norm(tg - r2, dim=-1))
+    return torch.norm(tg - 0.5 * (r1 + r2), dim=-1)
+
+
 def _mask_to_patch_labels(mask, grid, patch_size, overlap_thresh):
     m = mask[: grid * patch_size, : grid * patch_size]
     m = m.reshape(grid, patch_size, grid, patch_size).sum(axis=(1, 3))
@@ -93,7 +107,8 @@ def _heatmap(target_path, residual, grid, img_size, mask, out_path):
 
 @torch.no_grad()
 def evaluate_separability(backbone, root, split, device, img_size=224, patch_size=16,
-                          overlap_thresh=0, n_heatmaps=10, out_dir=None, tag="phase"):
+                          overlap_thresh=0, n_heatmaps=10, out_dir=None, tag="phase",
+                          residual_mode="mean"):
     """Returns a metrics dict. Writes heatmaps to out_dir if given."""
     backbone = backbone.to(device).eval()
     root = Path(root) / split
@@ -112,7 +127,7 @@ def evaluate_separability(backbone, root, split, device, img_size=224, patch_siz
         r1 = _patch_tokens(backbone, _load_norm(d / "ref1.png", img_size).to(device))
         r2 = _patch_tokens(backbone, _load_norm(d / "ref2.png", img_size).to(device))
         tg = _patch_tokens(backbone, _load_norm(d / "target.png", img_size).to(device))
-        residual = torch.norm(tg - 0.5 * (r1 + r2), dim=-1).cpu().numpy()   # (N,)
+        residual = _residual(tg, r1, r2, residual_mode).cpu().numpy()        # (N,)
 
         mask = cv2.imread(str(d / "mask.png"), cv2.IMREAD_GRAYSCALE)         # GT: eval only
         labels = _mask_to_patch_labels(mask, grid, patch_size, overlap_thresh)
@@ -135,6 +150,7 @@ def evaluate_separability(backbone, root, split, device, img_size=224, patch_siz
     auroc = _auroc(res, lab)
     ratio = (def_res.mean() / (norm_res.mean() + 1e-8)) if def_res.size else float("nan")
     return dict(auroc=float(auroc), defect_normal_ratio=float(ratio),
+                residual_mode=residual_mode,
                 mean_res_defect=float(def_res.mean()) if def_res.size else float("nan"),
                 mean_res_normal=float(norm_res.mean()),
                 n_defect_patches=int((lab == 1).sum()),
@@ -154,13 +170,14 @@ def evaluate_guardrail(backbone, root, split, device, **kw):
 
     backbone = backbone.to(device).eval()
     img_size = kw.get("img_size", 224)
+    residual_mode = kw.get("residual_mode", "mean")
     all_res = []
     for m in normals:
         d = root_p / m["id"]
         r1 = _patch_tokens(backbone, _load_norm(d / "ref1.png", img_size).to(device))
         r2 = _patch_tokens(backbone, _load_norm(d / "ref2.png", img_size).to(device))
         tg = _patch_tokens(backbone, _load_norm(d / "target.png", img_size).to(device))
-        all_res.append(torch.norm(tg - 0.5 * (r1 + r2), dim=-1).cpu().numpy())
+        all_res.append(_residual(tg, r1, r2, residual_mode).cpu().numpy())
     res = np.concatenate(all_res)
     return dict(guardrail_mean_res=float(res.mean()),
                 guardrail_p99_res=float(np.percentile(res, 99)), n=len(normals))

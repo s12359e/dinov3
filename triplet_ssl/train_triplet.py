@@ -19,6 +19,7 @@ import argparse
 import copy
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -26,6 +27,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import yaml
 
@@ -42,6 +44,56 @@ from triplet_ssl.eval.plot_curves import plot_training_curves
 from triplet_ssl import IMG_MEAN, IMG_STD
 
 NAMES = ("ref1", "ref2", "target")
+
+
+# --------------------------------------------------------------------------- #
+# Distributed (torchrun --nproc_per_node=N)
+# --------------------------------------------------------------------------- #
+def setup_distributed():
+    """Init from torchrun env. Returns local_rank, or None for single-process.
+
+    nccl on CUDA (H200s), gloo on CPU. DDP_INIT_FILE escape hatch: Windows
+    torch builds lack libuv so torchrun's TCPStore fails -- set DDP_INIT_FILE
+    to a shared temp path and launch the ranks manually to smoke-test DDP."""
+    if "RANK" not in os.environ:
+        return None
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    init_file = os.environ.get("DDP_INIT_FILE")
+    if init_file:
+        dist.init_process_group(backend=backend,
+                                init_method=f"file:///{Path(init_file).as_posix()}",
+                                rank=int(os.environ["RANK"]),
+                                world_size=int(os.environ["WORLD_SIZE"]))
+    else:
+        dist.init_process_group(backend=backend)
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    return local_rank
+
+
+class TripletStudent(nn.Module):
+    """Everything the student computes per step behind ONE forward().
+
+    DDP registers its gradient reducer on the wrapped module's forward; calling
+    submodules (backbone/heads) directly around a DDP wrapper breaks gradient
+    bucketing. This container is what gets DDP-wrapped."""
+
+    def __init__(self, backbone, cls_head, patch_head):
+        super().__init__()
+        self.backbone = backbone
+        self.cls_head = cls_head
+        self.patch_head = patch_head
+
+    def forward(self, s_nat, s_loc=None):
+        if s_loc is not None:
+            f_nat, f_loc = self.backbone.forward_features([s_nat, s_loc],
+                                                          masks=[None, None])
+            return (self.cls_head(f_loc["x_norm_clstoken"]),
+                    self.patch_head(f_nat["x_norm_patchtokens"]))
+        f = self.backbone.forward_features(s_nat)
+        return (self.cls_head(f["x_norm_clstoken"]),
+                self.patch_head(f["x_norm_patchtokens"]))
 
 
 # --------------------------------------------------------------------------- #
@@ -160,11 +212,24 @@ def main():
     if args.num_steps is not None: cfg["optim"]["num_steps"] = args.num_steps
     if args.batch_size is not None: cfg["optim"]["batch_size"] = args.batch_size
 
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    torch.manual_seed(cfg["seed"])
+    local_rank = setup_distributed()
+    ddp = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if ddp else 0
+    world = dist.get_world_size() if ddp else 1
+    is_main = rank == 0
+    if ddp:
+        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    # Per-rank seeds: each rank must draw DIFFERENT crops/batches.
+    torch.manual_seed(cfg["seed"] + rank)
+    np.random.seed(cfg["seed"] + rank)
     phase = cfg["phase"]
-    out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"=== Triplet SSL — Phase {phase} | device={device} ===")
+    out_dir = Path(args.out_dir)
+    if is_main:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"=== Triplet SSL — Phase {phase} | device={device} | "
+              f"world={world} ===")
 
     # -- Backbones (student + EMA teacher), init from checkpoint --------------
     student_bb = build_backbone(cfg, device)
@@ -180,12 +245,22 @@ def main():
     t_cls = copy.deepcopy(s_cls); t_patch = copy.deepcopy(s_patch)
     for h in (t_cls, t_patch): h.requires_grad_(False)
 
+    # Student container behind one forward() (required for DDP), then wrap.
+    student = TripletStudent(student_bb, s_cls, s_patch).to(device)
+    if ddp:
+        student = nn.parallel.DistributedDataParallel(
+            student, device_ids=[local_rank] if torch.cuda.is_available() else None)
+    core = student.module if ddp else student
+
     img_size, patch_size = cfg["model"]["img_size"], cfg["model"]["patch_size"]
 
     # ---- Phase 0: no training, evaluate frozen teacher ----------------------
     if phase == 0:
-        _evaluate_and_report(teacher_bb, cfg, device, out_dir, phase,
-                             notes="frozen DINOv3 baseline")
+        if is_main:
+            _evaluate_and_report(teacher_bb, cfg, device, out_dir, phase,
+                                 notes="frozen DINOv3 baseline")
+        if ddp:
+            dist.barrier(); dist.destroy_process_group()
         return
 
     # -- Loss ----------------------------------------------------------------
@@ -226,15 +301,17 @@ def main():
                                   load_masks=False, synth_defect=synth)
         print(f"[data] {len(train_ds)} triplets ({len(train_ds.defect_idx)} defective)")
     train_ds.assert_no_masks()
-    if synth is not None:
+    if synth is not None and is_main:
         augmentation_survival_check(train_ds, n=min(100, len(train_ds)))
 
     oc = cfg["oversample"]
-    bs = cfg["optim"]["batch_size"]
+    bs = cfg["optim"]["batch_size"]        # per-GPU; global = bs * world
+    if is_main and world > 1:
+        print(f"[dist] world={world}  per-GPU batch={bs}  global batch={bs * world}")
     sampler = DefectOversampleBatchSampler(
         train_ds, batch_size=bs,
         defect_frac=oc["defect_frac"] if oc["enable"] else None,
-        num_batches=cfg["optim"]["num_steps"], seed=cfg["seed"])
+        num_batches=cfg["optim"]["num_steps"], seed=cfg["seed"] + rank)
     nw = dc.get("num_workers", 0)
     loader = torch.utils.data.DataLoader(train_ds, batch_sampler=sampler,
                                          num_workers=nw, collate_fn=triplet_collate,
@@ -258,7 +335,8 @@ def main():
     tt_start = lc["teacher_temp"]
     tt_end = lc.get("teacher_temp_end", tt_start)
     tt_warm = max(1, int(lc.get("teacher_temp_warmup_frac", 0.3) * total))
-    student_bb.train(); s_cls.train(); s_patch.train()
+    amp_on = bool(cfg["optim"].get("amp", False)) and device.type == "cuda"
+    student.train()
     train_log = []
     t0 = time.time()
     for step, batch in enumerate(loader):
@@ -280,34 +358,29 @@ def main():
         s_nat = torch.cat([batch[n][:, 0] for n in NAMES]).to(device, non_blocking=True)
         t_nat = torch.cat([batch[n][:, 1] for n in NAMES]).to(device, non_blocking=True)
 
-        if has_cls_views:
-            s_loc = torch.cat([batch[n + "_cls"] for n in NAMES]).to(device, non_blocking=True)
-            # Both student resolutions in ONE call via the stock DINO multi-crop
-            # path (forward_features_list); heads applied selectively (patch head
-            # only on natives, CLS head only on locals) -- no wasted compute.
-            f_nat, f_loc = student_bb.forward_features([s_nat, s_loc],
-                                                       masks=[None, None])
-            ps_nat = s_patch(f_nat["x_norm_patchtokens"])
-            cs_all = s_cls(f_loc["x_norm_clstoken"])
-        else:
-            cs_all, ps_nat = embed(student_bb, s_cls, s_patch, s_nat)
-        with torch.no_grad():
-            ct_nat, pt_nat = embed(teacher_bb, t_cls, t_patch, t_nat)
+        s_loc = (torch.cat([batch[n + "_cls"] for n in NAMES]).to(device, non_blocking=True)
+                 if has_cls_views else None)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp_on):
+            # One student forward through the DDP-wrapped container (both
+            # resolutions via forward_features_list; heads applied selectively).
+            cs_all, ps_nat = student(s_nat, s_loc)
+            with torch.no_grad():
+                ct_nat, pt_nat = embed(teacher_bb, t_cls, t_patch, t_nat)
 
-        cls, patch = {}, {}
-        for i, n in enumerate(NAMES):
-            sl = slice(i * B, (i + 1) * B)
-            cls[n] = dict(s=cs_all[sl], t=ct_nat[sl].detach())
-            patch[n] = dict(s=ps_nat[sl], t=pt_nat[sl].detach())
+            cls, patch = {}, {}
+            for i, n in enumerate(NAMES):
+                sl = slice(i * B, (i + 1) * B)
+                cls[n] = dict(s=cs_all[sl], t=ct_nat[sl].detach())
+                patch[n] = dict(s=ps_nat[sl], t=pt_nat[sl].detach())
 
-        synth_mask = batch["synth_mask"].to(device) if "synth_mask" in batch else None
-        # TR-CLS exemption: target KNOWN to contain a defect (image-level flag or
-        # synthetic injection) -> drop that sample's target<->ref CLS pull.
-        cls_exempt = batch["is_defect"].to(device).bool()
-        if synth_mask is not None:
-            cls_exempt = cls_exempt | (synth_mask.sum(dim=1) > 0)
-        loss, logs = triplet_loss(cls, patch, trad_key=NAMES[step % 3],
-                                  synth_mask=synth_mask, cls_exempt=cls_exempt)
+            synth_mask = batch["synth_mask"].to(device) if "synth_mask" in batch else None
+            # TR-CLS exemption: target KNOWN to contain a defect (image-level flag
+            # or synthetic injection) -> drop that sample's target<->ref CLS pull.
+            cls_exempt = batch["is_defect"].to(device).bool()
+            if synth_mask is not None:
+                cls_exempt = cls_exempt | (synth_mask.sum(dim=1) > 0)
+            loss, logs = triplet_loss(cls, patch, trad_key=NAMES[step % 3],
+                                      synth_mask=synth_mask, cls_exempt=cls_exempt)
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -325,29 +398,33 @@ def main():
             row["repel"] = logs["repel"]
         train_log.append(row)
 
-        if step % max(1, total // 10) == 0 or step == total - 1:
+        if is_main and (step % max(1, total // 10) == 0 or step == total - 1):
             extra = f" repel={logs['repel']:.3f}" if "repel" in logs else ""
             print(f"step {step:04d}/{total} loss={loss.item():.4f} "
                   f"rr={logs['L_refref']:.3f} tr={logs['L_target2ref']:.3f} "
                   f"td={logs['L_trad']:.3f} lr={opt.param_groups[-1]['lr']:.2e}{extra}")
 
-    print(f"[train] {total} steps in {time.time() - t0:.1f}s")
+    if is_main:
+        print(f"[train] {total} steps in {time.time() - t0:.1f}s")
 
-    # -- Training curves ------------------------------------------------------
-    (out_dir / f"phase{phase}_train_log.json").write_text(json.dumps(train_log))
-    plot_training_curves(train_log, out_dir / f"phase{phase}_curves.png")
-    print(f"[curves] -> {out_dir / f'phase{phase}_curves.png'}")
+        # -- Training curves --------------------------------------------------
+        (out_dir / f"phase{phase}_train_log.json").write_text(json.dumps(train_log))
+        plot_training_curves(train_log, out_dir / f"phase{phase}_curves.png")
+        print(f"[curves] -> {out_dir / f'phase{phase}_curves.png'}")
 
-    # -- Exempted-patch sanity overlays (phase>=2) ----------------------------
-    if lc["topk_exempt"]["enable"]:
-        _log_exempt_overlays(triplet_loss, student_bb, s_cls, s_patch,
-                             teacher_bb, t_cls, t_patch, train_ds, device,
-                             out_dir, phase)
+        # -- Exempted-patch sanity overlays (phase>=2) ------------------------
+        if lc["topk_exempt"]["enable"]:
+            _log_exempt_overlays(triplet_loss, core.backbone, core.cls_head,
+                                 core.patch_head, teacher_bb, t_cls, t_patch,
+                                 train_ds, device, out_dir, phase)
 
-    torch.save({"teacher_backbone": teacher_bb.state_dict(), "phase": phase},
-               out_dir / f"phase{phase}_teacher.pth")
-    _evaluate_and_report(teacher_bb, cfg, device, out_dir, phase,
-                         notes=f"phase{phase} adapted")
+        torch.save({"teacher_backbone": teacher_bb.state_dict(), "phase": phase},
+                   out_dir / f"phase{phase}_teacher.pth")
+        _evaluate_and_report(teacher_bb, cfg, device, out_dir, phase,
+                             notes=f"phase{phase} adapted")
+    if ddp:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 @torch.no_grad()
@@ -396,13 +473,15 @@ def _evaluate_and_report(backbone, cfg, device, out_dir, phase, notes=""):
               "folder-format eval split (<id>/{ref1,ref2,target,mask}.png + manifest) "
               "to enable the separability gate.")
         return
+    rmode = ec.get("residual_mode", "mean")
     metrics = evaluate_separability(
         backbone, eval_root, dc["eval_split"], device,
         img_size=mc["img_size"], patch_size=mc["patch_size"],
         overlap_thresh=ec["overlap_thresh"], n_heatmaps=ec["n_heatmaps"],
-        out_dir=str(out_dir / f"phase{phase}_heatmaps"), tag=f"phase{phase}")
+        out_dir=str(out_dir / f"phase{phase}_heatmaps"), tag=f"phase{phase}",
+        residual_mode=rmode)
     guard = evaluate_guardrail(backbone, eval_root, dc["eval_split"], device,
-                               img_size=mc["img_size"])
+                               img_size=mc["img_size"], residual_mode=rmode)
     metrics.update(guard)
 
     baseline_file = out_dir / "phase0_auroc.txt"

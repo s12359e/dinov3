@@ -46,8 +46,11 @@ synth_defect:
   psf_amplitude: [15, 80]      # gray levels; polarity is local-background-aware
 
 optim:
+  amp: false                 # bf16 autocast(H100/H200 建議 true;CPU 自動忽略)
   backbone_lr: 1.0e-5        # small: continued pretraining (domain adaptation)
   head_lr: 1.0e-3            # heads train normally
+  # 大 global batch(bs × GPU 數)時依線性法則手動放大 LR:
+  # lr_eff = lr × global_batch / 你調參時的 batch
   layerwise_decay: 0.9
   weight_decay: 0.04
   momentum_teacher: 0.996        # cosine-ramped to momentum_teacher_final
@@ -60,6 +63,8 @@ optim:
 eval:
   overlap_thresh: 0          # patch is "defect" on any GT overlap
   n_heatmaps: 10
+  residual_mode: mean        # mean = 兩 ref 平均(refs 乾淨時噪聲最低)
+                             # min  = double detection(單邊 ref 髒不會誤報)
 
 separability_gate: {min_auroc_delta: 0.0}   # must beat the phase-0 baseline
 seed: 0
