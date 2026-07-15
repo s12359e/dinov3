@@ -28,3 +28,6 @@ dist/
 
 # Triplet SSL run outputs
 triplet_ssl/runs/
+
+# autoresearch_ssl trained checkpoints (99MB+, never commit)
+autoresearch_ssl/autoresearch_ssl/runs/
