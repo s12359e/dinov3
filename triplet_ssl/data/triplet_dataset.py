@@ -220,6 +220,30 @@ class TripletDataset(Dataset):
         return sample
 
 
+def read_tiff3(path, channel_order=(0, 1, 2)):
+    """3-channel TIFF -> (target, ref1, ref2), each grayscale replicated to 3ch
+    uint8. Supports uint8/uint16 and channels-last or 3-page layouts. Shared by
+    the training dataset and the inference script."""
+    from PIL import Image
+    img = Image.open(path)
+    arr = np.array(img)
+    if arr.ndim == 2 and getattr(img, "n_frames", 1) >= 3:   # 3-page layout
+        chans = []
+        for i in range(3):
+            img.seek(i)
+            chans.append(np.array(img))
+        arr = np.stack(chans, axis=-1)
+    if arr.ndim != 3 or arr.shape[2] < 3:
+        raise ValueError(f"{path}: expected 3-channel TIFF, got shape {arr.shape}")
+    if arr.dtype == np.uint16:
+        arr = (arr / 256).astype(np.uint8)
+    elif arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    co = channel_order
+    to3 = lambda c: np.repeat(arr[:, :, c:c + 1], 3, axis=2)
+    return to3(co[0]), to3(co[1]), to3(co[2])   # target, ref1, ref2
+
+
 class TiffTripletDataset(Dataset):
     """One 3-channel TIFF per pattern location: ch0=target, ch1=ref1, ch2=ref2.
 
@@ -263,25 +287,7 @@ class TiffTripletDataset(Dataset):
         assert not self.load_masks, "GT masks must not be loaded in the training path"
 
     def _read_tiff(self, path):
-        from PIL import Image
-        img = Image.open(path)
-        arr = np.array(img)
-        if arr.ndim == 2 and getattr(img, "n_frames", 1) >= 3:   # 3-page layout
-            chans = []
-            for i in range(3):
-                img.seek(i)
-                chans.append(np.array(img))
-            arr = np.stack(chans, axis=-1)
-        if arr.ndim != 3 or arr.shape[2] < 3:
-            raise ValueError(f"{path}: expected 3-channel TIFF, got shape {arr.shape}")
-        if arr.dtype == np.uint16:
-            arr = (arr / 256).astype(np.uint8)
-        elif arr.dtype != np.uint8:
-            arr = np.clip(arr, 0, 255).astype(np.uint8)
-        # each channel -> grayscale replicated to 3ch (ViT input convention)
-        co = self.channel_order
-        to3 = lambda c: np.repeat(arr[:, :, c:c + 1], 3, axis=2)
-        return to3(co[0]), to3(co[1]), to3(co[2])   # target, ref1, ref2
+        return read_tiff3(path, self.channel_order)
 
     def __getitem__(self, idx):
         path = self.files[idx]
