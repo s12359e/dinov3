@@ -145,6 +145,7 @@ def load_inference_bundle(ckpt_path, device, *, backbone_factory=None):
         preprocess.setdefault("uint16_black_level", 0.0)
         preprocess.setdefault("uint16_white_level", 65535.0)
         preprocess["uint16_decode_mode"] = "legacy_high_byte"
+        preprocess.setdefault("source_dtype", None)
     elif scaling in {"fixed_uint16_range_to_uint8_v1",
                      "fixed_uint16_range_to_0_255_float_v1"}:
         if not {"uint16_black_level", "uint16_white_level"}.issubset(preprocess):
@@ -152,6 +153,19 @@ def load_inference_bundle(ckpt_path, device, *, backbone_factory=None):
         preprocess["uint16_decode_mode"] = (
             "uint8_linear" if scaling == "fixed_uint16_range_to_uint8_v1"
             else "float_linear")
+        preprocess.setdefault("source_dtype", None)
+    elif scaling == "uint8_0_255_identity_v1":
+        preprocess.setdefault("uint16_black_level", 0.0)
+        preprocess.setdefault("uint16_white_level", 65535.0)
+        preprocess["uint16_decode_mode"] = "float_linear"
+        preprocess["source_dtype"] = "uint8"
+    elif scaling == "float_0_255_identity_v1":
+        preprocess.setdefault("uint16_black_level", 0.0)
+        preprocess.setdefault("uint16_white_level", 65535.0)
+        preprocess["uint16_decode_mode"] = "float_linear"
+        source_dtype = str(preprocess.get("source_dtype", ""))
+        if not source_dtype.startswith("float"):
+            raise ValueError("float TIFF scaling requires a floating source_dtype")
     else:
         raise ValueError(f"unsupported input scaling: {scaling!r}")
     black = float(preprocess["uint16_black_level"])
@@ -284,7 +298,8 @@ def score_map(model, path, device, tile=128, residual_mode="min",
               fusion_head=None, channel_order=(0, 1, 2),
               uint16_black_level=0.0, uint16_white_level=65535.0,
               normalization_mean=IMG_MEAN, normalization_std=IMG_STD,
-              context_halo=0, uint16_decode_mode="float_linear"):
+              context_halo=0, uint16_decode_mode="float_linear",
+              expected_dtype=None):
     """Return valid-grid scores/diagnostics, original size, and target image."""
     requested_method = method
     method = resolve_inference_method(method, fusion_head)
@@ -311,7 +326,8 @@ def score_map(model, path, device, tile=128, residual_mode="min",
         path, channel_order=tuple(channel_order),
         uint16_black_level=uint16_black_level,
         uint16_white_level=uint16_white_level,
-        uint16_decode_mode=uint16_decode_mode)
+        uint16_decode_mode=uint16_decode_mode,
+        expected_dtype=expected_dtype)
     norm_mean = np.asarray(normalization_mean, np.float32).reshape(1, 1, 3)
     norm_std = np.asarray(normalization_std, np.float32).reshape(1, 1, 3)
     if not np.isfinite(norm_mean).all() or not np.isfinite(norm_std).all() \
@@ -512,6 +528,8 @@ def main():
     uint16_black = float(preprocess.get("uint16_black_level", 0.0))
     uint16_white = float(preprocess.get("uint16_white_level", 65535.0))
     uint16_decode_mode = preprocess.get("uint16_decode_mode", "float_linear")
+    source_dtype = preprocess.get("source_dtype")
+    training_source_layout = preprocess.get("source_layout")
     norm_mean = tuple(preprocess.get("mean", IMG_MEAN))
     norm_std = tuple(preprocess.get("std", IMG_STD))
     trained_register = bool(preprocess.get("register", args.register))
@@ -536,7 +554,8 @@ def main():
                  uint16_white_level=uint16_white,
                  normalization_mean=norm_mean, normalization_std=norm_std,
                  context_halo=args.context_halo,
-                 uint16_decode_mode=uint16_decode_mode)
+                 uint16_decode_mode=uint16_decode_mode,
+                 expected_dtype=source_dtype)
     if method == "knn":
         tag_m = f"knn w={args.knn_window} k={args.knn_k}"
     elif method == "fusion":
@@ -576,6 +595,8 @@ def main():
             "uint16_black_level": uint16_black,
             "uint16_white_level": uint16_white,
             "uint16_decode_mode": uint16_decode_mode,
+            "source_dtype": source_dtype,
+            "training_source_layout": training_source_layout,
             "normalization_mean": list(norm_mean),
             "normalization_std": list(norm_std),
         }
@@ -607,6 +628,8 @@ def main():
         "uint16_black_level": uint16_black,
         "uint16_white_level": uint16_white,
         "uint16_decode_mode": uint16_decode_mode,
+        "source_dtype": source_dtype,
+        "training_source_layout": training_source_layout,
         "normalization_mean": list(norm_mean),
         "normalization_std": list(norm_std),
         "score_semantics": ("sigmoid(target_unique_logit)" if method == "fusion"

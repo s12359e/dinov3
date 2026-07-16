@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import tifffile
 from PIL import Image
 
 from triplet_ssl import IMG_MEAN, IMG_STD
@@ -54,6 +55,61 @@ def write_tiff(path, h, w):
 
 
 class FusionInferenceTest(unittest.TestCase):
+    def test_float32_single_page_hwc_and_chw_layouts(self):
+        with tempfile.TemporaryDirectory() as td:
+            hwc_path = Path(td) / "train_hwc.tiff"
+            hwc = np.empty((384, 384, 3), np.float32)
+            hwc[..., 0], hwc[..., 1], hwc[..., 2] = 11.25, 22.5, 33.75
+            tifffile.imwrite(
+                hwc_path, hwc, photometric="rgb", planarconfig="contig",
+                metadata={"axes": "YXS"})
+            target, ref1, ref2, meta = read_tiff3(
+                hwc_path, expected_dtype="float32", return_metadata=True)
+            self.assertEqual(target.shape, (384, 384, 3))
+            self.assertEqual(meta["source_layout"], "YXS")
+            self.assertEqual(meta["sample_format"], 3)
+            np.testing.assert_allclose(
+                [target[0, 0, 0], ref1[0, 0, 0], ref2[0, 0, 0]],
+                [11.25, 22.5, 33.75])
+
+            chw_path = Path(td) / "test_chw.tiff"
+            chw = np.empty((3, 448, 464), np.float32)
+            chw[0], chw[1], chw[2] = 17.125, 91.5, 203.875
+            tifffile.imwrite(
+                chw_path, chw, photometric="rgb", planarconfig="separate",
+                metadata={"axes": "SYX"})
+            # Verify role mapping occurs after SYX -> YXS canonicalization.
+            target, ref1, ref2, meta = read_tiff3(
+                chw_path, channel_order=(2, 0, 1), expected_dtype="float32",
+                return_metadata=True)
+            self.assertEqual(target.shape, (448, 464, 3))
+            self.assertEqual(meta["source_layout"], "SYX")
+            np.testing.assert_allclose(
+                [target[0, 0, 0], ref1[0, 0, 0], ref2[0, 0, 0]],
+                [203.875, 17.125, 91.5])
+            scores, _, hw, _ = score_map(
+                FakeBackbone(), chw_path, torch.device("cpu"), tile=128,
+                context_halo=32, chunk=16, method="fusion",
+                fusion_head=ZeroFusionHead(), channel_order=(2, 0, 1),
+                expected_dtype="float32")
+            self.assertEqual(hw, (448, 464))
+            self.assertEqual(scores.shape, (28, 29))
+            np.testing.assert_allclose(scores, 0.5)
+
+    def test_float_tiff_rejects_nonfinite_and_out_of_range_values(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "bad_float.tiff"
+            bad = np.zeros((8, 8, 3), np.float32)
+            bad[0, 0, 0] = np.nan
+            tifffile.imwrite(path, bad, photometric="rgb", metadata={"axes": "YXS"})
+            with self.assertRaisesRegex(ValueError, "NaN or Inf"):
+                read_tiff3(path)
+
+            bad[0, 0, 0] = 256.0
+            tifffile.imwrite(path, bad, photometric="rgb", metadata={"axes": "YXS"})
+            with self.assertRaisesRegex(ValueError, "must already be in"):
+                read_tiff3(path)
+
     def test_fusion_score_map_crops_padding_and_sigmoids_once(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "sample.tiff"
@@ -176,7 +232,11 @@ class FusionInferenceTest(unittest.TestCase):
             "preprocess": {
                 "mean": [11.0, 12.0, 13.0],
                 "std": [2.0, 3.0, 4.0],
-                "input_scaling": "fixed_uint16_range_to_0_255_float_v1",
+                "input_scaling": "float_0_255_identity_v1",
+                "source_dtype": "float32",
+                "source_layout": "YXS",
+                "sample_format": 3,
+                "supported_tiff_layouts": ["YXS", "SYX", "3PAGE_YX"],
                 "uint16_black_level": 0,
                 "uint16_white_level": 4095,
                 "channel_order": ["target", "ref1", "ref2"],
@@ -195,6 +255,7 @@ class FusionInferenceTest(unittest.TestCase):
         self.assertEqual(meta["checkpoint_version"], 2)
         self.assertEqual(meta["preprocess"]["uint16_white_level"], 4095)
         self.assertEqual(meta["preprocess"]["mean"], [11.0, 12.0, 13.0])
+        self.assertEqual(meta["preprocess"]["source_dtype"], "float32")
 
     def test_uint16_tiff_uses_explicit_sensor_range(self):
         values = (np.arange(16, dtype=np.uint16).reshape(4, 4) * 273)

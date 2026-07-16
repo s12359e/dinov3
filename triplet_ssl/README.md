@@ -24,6 +24,7 @@ $PY = "C:\Users\Peter Peng\AppData\Local\Programs\Python\Python312\python.exe"
 ```
 
 所有指令都在 repo 根目錄(`claude\dinov3`)執行。
+Scientific TIFF reader 使用 `tifffile`（已列入 `requirements.txt`）。
 
 ## 目錄結構
 
@@ -110,11 +111,16 @@ teacher checkpoint，否則會重新從 base checkpoint 開始。
   `assert_no_masks()` 保證絕不讀取。
 - 灰階圖請存成 3 通道 PNG(灰階複製三份),或存單通道由 cv2 讀成 3 通道亦可。
 
+TIFF 模式是一個檔案包含 target/ref1/ref2 三個語意 samples。reader 依 TIFF
+metadata 接受單頁 `YXS=(H,W,3)`、單頁 `SYX=(3,H,W)` 或三個 grayscale pages，
+統一成 HWC 後才套 `channel_order`。目前 production 規格為 float32、
+SampleFormat=3、0..255，會原值保留；NaN、Inf 或越界會直接失敗，不做 per-image min-max。
+
 ### 真資料 checklist(重要)
 
 1. **重算 normalization**:`triplet_ssl/__init__.py` 的 `IMG_MEAN / IMG_STD`
    目前是合成 SEM 統計,務必用 `tools/compute_stats.py` 換成 optical training
-   set 統計；uint16 必須傳入與 config 相同的 black/white level。
+   set 統計；float32 直接使用 0..255，uint16 才需傳入相同 black/white level。
 2. **保留原生 PSF**:`phase3_tiff.yaml` 會從約 480px TIFF 裁原生 128px window，
    不 resize，因此 4–6px PSF 不會先被縮掉。不要改回 224px whole-image resize。
 3. **對位**:die-to-die 有偏移就開 `data.register: true`。對位是
@@ -265,8 +271,8 @@ target 是特殊角色；ref1/ref2 共用權重，互換後輸出完全不變。
 `000` negatives；高 residual 的未標註背景仍忽略，避免把未知真缺陷拉成 normal。
 
 `phase3_teacher.pth` 是 version-2 部署 bundle，包含 EMA teacher backbone、EMA
-fusion head、架構契約、patch size、channel order、registration 以及 uint16
-black/white level。省略 `--tile` 時會自動使用 checkpoint 的 training tile。
+fusion head、架構契約、patch size、channel order、registration、source dtype/layout
+以及必要的 uint16 black/white level。省略 `--tile` 時會自動使用 checkpoint 的 training tile。
 Fusion 預設用 32px context halo：每次仍送 128px tile，但只拼中央 64px，避免
 6px PSF 恰好跨 tile seam；`--chunk 1` 的 VRAM 不增加，計算量約為非重疊的 4 倍。
 如要關閉可明確傳 `--context-halo 0`，但必須重新校準 threshold。

@@ -229,26 +229,93 @@ class TripletDataset(Dataset):
         return sample
 
 
+def _read_tiff3_array(path):
+    """Decode exactly three TIFF samples without applying RGB/BGR conversion."""
+    try:
+        import tifffile
+    except ImportError as exc:
+        raise RuntimeError(
+            "read_tiff3 requires tifffile for scientific/float TIFF input; "
+            "install it with `python -m pip install tifffile`") from exc
+
+    with tifffile.TiffFile(path) as tif:
+        if len(tif.series) != 1:
+            raise ValueError(f"{path}: expected exactly one TIFF series, got {len(tif.series)}")
+        series = tif.series[0]
+        pages = list(series.pages)
+        if len(pages) == 1:
+            page = pages[0]
+            samples = int(page.samplesperpixel or 1)
+            if samples != 3:
+                raise ValueError(
+                    f"{path}: single-page TIFF must have SamplesPerPixel=3, got {samples}")
+            arr = series.asarray()
+            axes = series.axes
+            planar = int(page.planarconfig or 1)
+            if planar == 1:  # CONTIG: (Y, X, S)
+                if axes != "YXS" or arr.ndim != 3 or arr.shape[-1] != 3:
+                    raise ValueError(
+                        f"{path}: CONTIG TIFF must be axes=YXS / shape=(H,W,3), "
+                        f"got axes={axes!r} shape={arr.shape}")
+                layout = "YXS"
+            elif planar == 2:  # SEPARATE: (S, Y, X)
+                if axes != "SYX" or arr.ndim != 3 or arr.shape[0] != 3:
+                    raise ValueError(
+                        f"{path}: SEPARATE TIFF must be axes=SYX / shape=(3,H,W), "
+                        f"got axes={axes!r} shape={arr.shape}")
+                arr = np.moveaxis(arr, 0, -1)
+                layout = "SYX"
+            else:
+                raise ValueError(f"{path}: unsupported PlanarConfiguration={planar}")
+            sample_format = int(page.sampleformat or 1)
+        elif len(pages) == 3:
+            decoded = []
+            shapes, dtypes, sample_formats = set(), set(), set()
+            for page in pages:
+                if int(page.samplesperpixel or 1) != 1:
+                    raise ValueError(f"{path}: each page must contain one grayscale sample")
+                image = page.asarray()
+                if image.ndim != 2:
+                    raise ValueError(f"{path}: each grayscale page must be 2-D")
+                decoded.append(image)
+                shapes.add(image.shape)
+                dtypes.add(image.dtype.str)
+                sample_formats.add(int(page.sampleformat or 1))
+            if len(shapes) != 1 or len(dtypes) != 1 or len(sample_formats) != 1:
+                raise ValueError(f"{path}: three grayscale pages must share shape/dtype/sample format")
+            arr = np.stack(decoded, axis=-1)
+            layout = "3PAGE_YX"
+            sample_format = sample_formats.pop()
+        else:
+            raise ValueError(
+                f"{path}: expected one 3-sample page or three grayscale pages, "
+                f"got {len(pages)} pages")
+
+    arr = np.ascontiguousarray(arr)
+    return arr, {
+        "source_dtype": str(arr.dtype),
+        "source_layout": layout,
+        "sample_format": sample_format,
+    }
+
+
 def read_tiff3(path, channel_order=(0, 1, 2),
                uint16_black_level=0.0, uint16_white_level=65535.0,
-               uint16_decode_mode="float_linear"):
+               uint16_decode_mode="float_linear", expected_dtype=None,
+               return_metadata=False):
     """3-channel TIFF -> (target, ref1, ref2), each grayscale replicated to 3ch
-    values on a 0..255 scale. Supports uint8/uint16 and channels-last or 3-page
-    layouts. uint16 remains float32 after scaling so sub-8-bit contrast is not
+    values on a 0..255 scale. Supports uint8/uint16/float32 and metadata-verified
+    HWC (YXS), CHW (SYX), or three-page layouts. uint16 remains float32 after
+    scaling so sub-8-bit contrast is not
     quantized away. uint16 is
     mapped through an explicit acquisition range, e.g. black=0/white=4095 for
     right-aligned 12-bit sensor data. Shared by training and inference."""
-    from PIL import Image
-    with Image.open(path) as img:
-        arr = np.array(img)
-        if arr.ndim == 2 and getattr(img, "n_frames", 1) >= 3:  # 3-page layout
-            chans = []
-            for i in range(3):
-                img.seek(i)
-                chans.append(np.array(img))
-            arr = np.stack(chans, axis=-1)
-    if arr.ndim != 3 or arr.shape[2] < 3:
-        raise ValueError(f"{path}: expected 3-channel TIFF, got shape {arr.shape}")
+    arr, metadata = _read_tiff3_array(path)
+    if expected_dtype is not None and str(arr.dtype) != str(expected_dtype):
+        raise ValueError(
+            f"{path}: source dtype changed from training {expected_dtype} to {arr.dtype}")
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError(f"{path}: expected canonical shape (H,W,3), got {arr.shape}")
     if arr.dtype == np.uint16:
         if uint16_decode_mode == "legacy_high_byte":
             arr = (arr // 256).astype(np.uint8)
@@ -266,12 +333,22 @@ def read_tiff3(path, channel_order=(0, 1, 2),
             else:
                 arr = arr.astype(np.float32)
     elif np.issubdtype(arr.dtype, np.floating):
+        if not np.isfinite(arr).all():
+            raise ValueError(f"{path}: floating TIFF contains NaN or Inf")
+        lo, hi = float(arr.min()), float(arr.max())
+        if lo < -1e-4 or hi > 255.0001:
+            raise ValueError(
+                f"{path}: floating TIFF must already be in [0,255], got [{lo},{hi}]")
         arr = np.clip(arr, 0, 255).astype(np.float32)
     elif arr.dtype != np.uint8:
         arr = np.clip(arr, 0, 255).astype(np.uint8)
-    co = channel_order
+    co = tuple(int(c) for c in channel_order)
+    if len(co) != 3 or sorted(co) != [0, 1, 2]:
+        raise ValueError("channel_order must be a permutation of (0,1,2)")
     to3 = lambda c: np.repeat(arr[:, :, c:c + 1], 3, axis=2)
-    return to3(co[0]), to3(co[1]), to3(co[2])   # target, ref1, ref2
+    result = (to3(co[0]), to3(co[1]), to3(co[2]))  # target, ref1, ref2
+    metadata["decoded_dtype"] = str(result[0].dtype)
+    return result + (metadata,) if return_metadata else result
 
 
 class TiffTripletDataset(Dataset):
@@ -305,6 +382,14 @@ class TiffTripletDataset(Dataset):
         self.channel_order = channel_order   # (target, ref1, ref2) channel indices
         self.uint16_black_level = float(uint16_black_level)
         self.uint16_white_level = float(uint16_white_level)
+        _, _, _, source_meta = read_tiff3(
+            self.files[0], self.channel_order,
+            uint16_black_level=self.uint16_black_level,
+            uint16_white_level=self.uint16_white_level,
+            return_metadata=True)
+        self.source_dtype = source_meta["source_dtype"]
+        self.source_layout = source_meta["source_layout"]
+        self.sample_format = source_meta["sample_format"]
         if cls_local_size is not None:
             assert cls_local_size % patch_size == 0 and cls_local_size < crop_size
         self.cls_local_size = cls_local_size  # student-side local CLS view (no resize)
@@ -323,7 +408,8 @@ class TiffTripletDataset(Dataset):
         return read_tiff3(
             path, self.channel_order,
             uint16_black_level=self.uint16_black_level,
-            uint16_white_level=self.uint16_white_level)
+            uint16_white_level=self.uint16_white_level,
+            expected_dtype=self.source_dtype)
 
     def __getitem__(self, idx):
         path = self.files[idx]

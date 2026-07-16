@@ -560,6 +560,15 @@ def main():
                                  core.patch_head, teacher_bb, t_cls, t_patch,
                                  train_ds, device, out_dir, phase)
 
+        source_dtype = getattr(train_ds, "source_dtype", "uint8")
+        if source_dtype == "uint16":
+            input_scaling = "fixed_uint16_range_to_0_255_float_v1"
+        elif source_dtype == "uint8":
+            input_scaling = "uint8_0_255_identity_v1"
+        elif source_dtype.startswith("float"):
+            input_scaling = "float_0_255_identity_v1"
+        else:
+            raise ValueError(f"unsupported training TIFF dtype for deployment: {source_dtype}")
         checkpoint = {
             "checkpoint_version": 2 if t_fusion is not None else 1,
             "backbone_config": export_backbone_config(),
@@ -568,7 +577,11 @@ def main():
             "preprocess": {
                 "mean": list(IMG_MEAN),
                 "std": list(IMG_STD),
-                "input_scaling": "fixed_uint16_range_to_0_255_float_v1",
+                "input_scaling": input_scaling,
+                "source_dtype": source_dtype,
+                "source_layout": getattr(train_ds, "source_layout", "folder_hwc"),
+                "sample_format": getattr(train_ds, "sample_format", None),
+                "supported_tiff_layouts": ["YXS", "SYX", "3PAGE_YX"],
                 "uint16_black_level": float(dc.get("uint16_black_level", 0)),
                 "uint16_white_level": float(dc.get("uint16_white_level", 65535)),
                 "channel_order": ["target", "ref1", "ref2"],

@@ -34,7 +34,7 @@ data:
   num_workers: 0             # dataloader workers(GPU 訓練時建議 2-4,撒點/對位不卡 GPU)
   register: false            # phase-correlation die-to-die pre-registration
   # uint16 acquisition mapping before DINO normalization. For right-aligned
-  # 12-bit TIFF set white_level=4095; these values are stored in the checkpoint.
+  # 12-bit TIFF set white_level=4095; float32 0..255 bypasses these fields.
   uint16_black_level: 0
   uint16_white_level: 65535
   crop_scale: [0.4, 1.0]

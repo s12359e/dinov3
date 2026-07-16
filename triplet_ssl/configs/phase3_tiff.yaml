@@ -1,5 +1,6 @@
 # TIFF 3 通道模式範例:一個 .tif = 一個 pattern 位置,
-# ch1 = target, ch2 = ref1, ch3 = ref2(uint8 或 uint16、channels-last 或 3-page 皆可)。
+# sample 0=target, 1=ref1, 2=ref2。支援 float32/uint8/uint16；單頁 YXS(HWC)、
+# 單頁 SYX(CHW/PlanarConfig SEPARATE)與 3-page 都會由 TIFF metadata 嚴格判定。
 # 流程:原生解析度 128x128 視窗裁切(不 resize)→ 裁切後 on-the-fly 貼 PSF 事件。
 base: base.yaml
 phase: 3
