@@ -185,10 +185,11 @@ class TripletDataset(Dataset):
         # defect on target. Only the defect's pixel mask comes back; it rides the
         # SAME geometric transform, so patch alignment holds AND the survival check
         # is meaningful (the defect can genuinely be cropped out).
-        pix_mask = None
+        pix_mask = event_mask = unmatched_mask = None
         if self.synth_defect is not None:
-            ref1, ref2, target, pix_mask = self.synth_defect(
-                ref1, ref2, target, is_defect=m["has_defect"])
+            ref1, ref2, target, pix_mask, event_mask, unmatched_mask = self.synth_defect(
+                ref1, ref2, target, is_defect=m["has_defect"],
+                return_supervision=True)
 
         # Shared geometric crop (sampled once) applied to all three.
         h, w = ref1.shape[:2]
@@ -199,7 +200,7 @@ class TripletDataset(Dataset):
 
         # Always emit a synth_mask when synth is enabled (zeros if not injected) so
         # every sample in a batch has the same keys for collation.
-        synth_patch_mask = None
+        synth_patch_mask = synth_event_patch_mask = synth_unmatched_patch_mask = None
         if self.synth_defect is not None:
             if pix_mask is not None:
                 mask_c = self.transform.apply_geom(pix_mask, g, interp=cv2.INTER_NEAREST)
@@ -207,6 +208,11 @@ class TripletDataset(Dataset):
             else:
                 n = (self.transform.img_size // self.patch_size) ** 2
                 synth_patch_mask = np.zeros(n, np.float32)
+            event_c = self.transform.apply_geom(event_mask, g, interp=cv2.INTER_NEAREST)
+            synth_event_patch_mask = self._pixel_to_patch_mask(event_c)
+            unmatched_c = self.transform.apply_geom(
+                unmatched_mask, g, interp=cv2.INTER_NEAREST)
+            synth_unmatched_patch_mask = self._pixel_to_patch_mask(unmatched_c)
 
         def views(img):  # two independent photometric variants (student, teacher)
             return torch.stack([self.transform.photometric(img),
@@ -216,27 +222,51 @@ class TripletDataset(Dataset):
                       is_defect=bool(m["has_defect"]), id=tid)
         if synth_patch_mask is not None:
             sample["synth_mask"] = torch.from_numpy(synth_patch_mask).float()
+            sample["synth_event_mask"] = torch.from_numpy(synth_event_patch_mask).float()
+            sample["synth_unmatched_mask"] = torch.from_numpy(
+                synth_unmatched_patch_mask).float()
             sample["synth_injected"] = pix_mask is not None
         return sample
 
 
-def read_tiff3(path, channel_order=(0, 1, 2)):
+def read_tiff3(path, channel_order=(0, 1, 2),
+               uint16_black_level=0.0, uint16_white_level=65535.0,
+               uint16_decode_mode="float_linear"):
     """3-channel TIFF -> (target, ref1, ref2), each grayscale replicated to 3ch
-    uint8. Supports uint8/uint16 and channels-last or 3-page layouts. Shared by
-    the training dataset and the inference script."""
+    values on a 0..255 scale. Supports uint8/uint16 and channels-last or 3-page
+    layouts. uint16 remains float32 after scaling so sub-8-bit contrast is not
+    quantized away. uint16 is
+    mapped through an explicit acquisition range, e.g. black=0/white=4095 for
+    right-aligned 12-bit sensor data. Shared by training and inference."""
     from PIL import Image
-    img = Image.open(path)
-    arr = np.array(img)
-    if arr.ndim == 2 and getattr(img, "n_frames", 1) >= 3:   # 3-page layout
-        chans = []
-        for i in range(3):
-            img.seek(i)
-            chans.append(np.array(img))
-        arr = np.stack(chans, axis=-1)
+    with Image.open(path) as img:
+        arr = np.array(img)
+        if arr.ndim == 2 and getattr(img, "n_frames", 1) >= 3:  # 3-page layout
+            chans = []
+            for i in range(3):
+                img.seek(i)
+                chans.append(np.array(img))
+            arr = np.stack(chans, axis=-1)
     if arr.ndim != 3 or arr.shape[2] < 3:
         raise ValueError(f"{path}: expected 3-channel TIFF, got shape {arr.shape}")
     if arr.dtype == np.uint16:
-        arr = (arr / 256).astype(np.uint8)
+        if uint16_decode_mode == "legacy_high_byte":
+            arr = (arr // 256).astype(np.uint8)
+        elif uint16_decode_mode not in {"float_linear", "uint8_linear"}:
+            raise ValueError(f"unsupported uint16_decode_mode={uint16_decode_mode!r}")
+        black = float(uint16_black_level)
+        white = float(uint16_white_level)
+        if not np.isfinite(black) or not np.isfinite(white) or white <= black:
+            raise ValueError("uint16_white_level must be finite and > uint16_black_level")
+        if uint16_decode_mode != "legacy_high_byte":
+            arr = (arr.astype(np.float32) - black) * (255.0 / (white - black))
+            arr = np.clip(arr, 0, 255)
+            if uint16_decode_mode == "uint8_linear":
+                arr = np.rint(arr).astype(np.uint8)
+            else:
+                arr = arr.astype(np.float32)
+    elif np.issubdtype(arr.dtype, np.floating):
+        arr = np.clip(arr, 0, 255).astype(np.float32)
     elif arr.dtype != np.uint8:
         arr = np.clip(arr, 0, 255).astype(np.uint8)
     co = channel_order
@@ -261,7 +291,8 @@ class TiffTripletDataset(Dataset):
 
     def __init__(self, root, crop_size=128, transform=None, register=False,
                  patch_size=16, synth_defect=None, channel_order=(0, 1, 2),
-                 cls_local_size=64):
+                 cls_local_size=64, uint16_black_level=0.0,
+                 uint16_white_level=65535.0):
         self.files = sorted(list(Path(root).glob("*.tif")) + list(Path(root).glob("*.tiff")))
         if not self.files:
             raise FileNotFoundError(f"no .tif/.tiff in {root}")
@@ -272,6 +303,8 @@ class TiffTripletDataset(Dataset):
         self.max_shift_assert = patch_size / 2.0
         self.synth_defect = synth_defect
         self.channel_order = channel_order   # (target, ref1, ref2) channel indices
+        self.uint16_black_level = float(uint16_black_level)
+        self.uint16_white_level = float(uint16_white_level)
         if cls_local_size is not None:
             assert cls_local_size % patch_size == 0 and cls_local_size < crop_size
         self.cls_local_size = cls_local_size  # student-side local CLS view (no resize)
@@ -287,7 +320,10 @@ class TiffTripletDataset(Dataset):
         assert not self.load_masks, "GT masks must not be loaded in the training path"
 
     def _read_tiff(self, path):
-        return read_tiff3(path, self.channel_order)
+        return read_tiff3(
+            path, self.channel_order,
+            uint16_black_level=self.uint16_black_level,
+            uint16_white_level=self.uint16_white_level)
 
     def __getitem__(self, idx):
         path = self.files[idx]
@@ -312,19 +348,23 @@ class TiffTripletDataset(Dataset):
         tgt_c, r1_c, r2_c = cut(target), cut(ref1), cut(ref2)
 
         # On-the-fly synthetic PSF events ON THE CROP (user's recipe: crop then paste).
-        pix_mask = None
+        pix_mask = event_mask = unmatched_mask = None
         if self.synth_defect is not None:
-            r1_c, r2_c, tgt_c, pix_mask = self.synth_defect(r1_c, r2_c, tgt_c,
-                                                            is_defect=False)
-        synth_patch_mask = None
+            r1_c, r2_c, tgt_c, pix_mask, event_mask, unmatched_mask = self.synth_defect(
+                r1_c, r2_c, tgt_c, is_defect=False, return_supervision=True)
+        synth_patch_mask = synth_event_patch_mask = synth_unmatched_patch_mask = None
         if self.synth_defect is not None:
-            if pix_mask is not None:
-                g = c // self.patch_size
-                m = pix_mask[: g * self.patch_size, : g * self.patch_size]
+            g = c // self.patch_size
+            def to_patch_mask(mask):
+                m = mask[: g * self.patch_size, : g * self.patch_size]
                 m = m.reshape(g, self.patch_size, g, self.patch_size).max(axis=(1, 3))
-                synth_patch_mask = (m > 0).astype(np.float32).reshape(-1)
+                return (m > 0).astype(np.float32).reshape(-1)
+            if pix_mask is not None:
+                synth_patch_mask = to_patch_mask(pix_mask)
             else:
-                synth_patch_mask = np.zeros((c // self.patch_size) ** 2, np.float32)
+                synth_patch_mask = np.zeros(g * g, np.float32)
+            synth_event_patch_mask = to_patch_mask(event_mask)
+            synth_unmatched_patch_mask = to_patch_mask(unmatched_mask)
 
         def views(img):   # two independent photometric variants (student, teacher)
             return torch.stack([self.transform.photometric(img),
@@ -352,6 +392,9 @@ class TiffTripletDataset(Dataset):
 
         if synth_patch_mask is not None:
             sample["synth_mask"] = torch.from_numpy(synth_patch_mask).float()
+            sample["synth_event_mask"] = torch.from_numpy(synth_event_patch_mask).float()
+            sample["synth_unmatched_mask"] = torch.from_numpy(
+                synth_unmatched_patch_mask).float()
             sample["synth_injected"] = pix_mask is not None
         return sample
 
@@ -366,6 +409,11 @@ def triplet_collate(batch):
     )
     if "synth_mask" in batch[0]:
         out["synth_mask"] = torch.stack([b["synth_mask"] for b in batch])
+    if "synth_event_mask" in batch[0]:
+        out["synth_event_mask"] = torch.stack([b["synth_event_mask"] for b in batch])
+    if "synth_unmatched_mask" in batch[0]:
+        out["synth_unmatched_mask"] = torch.stack(
+            [b["synth_unmatched_mask"] for b in batch])
     for k in ("ref1_cls", "ref2_cls", "target_cls"):
         if k in batch[0]:
             out[k] = torch.stack([b[k] for b in batch])

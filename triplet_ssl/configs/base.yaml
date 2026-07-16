@@ -10,6 +10,20 @@ model:
   head_bottleneck: 128
   head_nlayers: 2
 
+# Directional detector deployed with the EMA teacher backbone.  It treats
+# target as a distinct role while remaining invariant to ref1/ref2 swapping.
+# Phase 3 enables it, because the full synthetic presence truth table is then
+# available for supervision.
+fusion_head:
+  enable: false
+  hidden_dim: 128
+  dropout: 0.1
+  prior_prob: 0.01
+  loss_weight: 0.5
+  warmup_steps: 10
+  ema_momentum: 0.9
+  background_negative_frac: 0.25
+
 # Initialise from DINOv3 pretrained weights (mimic until real weights are placed).
 checkpoint: checkpoints/dinov3_vitb16_mimic.pth
 
@@ -19,6 +33,10 @@ data:
   eval_split: val
   num_workers: 0             # dataloader workers(GPU 訓練時建議 2-4,撒點/對位不卡 GPU)
   register: false            # phase-correlation die-to-die pre-registration
+  # uint16 acquisition mapping before DINO normalization. For right-aligned
+  # 12-bit TIFF set white_level=4095; these values are stored in the checkpoint.
+  uint16_black_level: 0
+  uint16_white_level: 65535
   crop_scale: [0.4, 1.0]
   flip_prob: 0.5             # horizontal only; vertical flip is forbidden in code
   brightness_delta: 15
@@ -27,7 +45,9 @@ data:
   blur_prob: 0.0
 
 loss:
-  weights: {traditional: 0.3, ref2ref: 0.4, target2ref: 0.3}
+  # No unconditional ref1<->ref2 pull: a PSF present in only one reference is
+  # a nuisance, and must remain visible for the triplet comparison.
+  weights: {traditional: 0.5, target2ref: 0.5}
   student_temp: 0.1
   teacher_temp: 0.04           # warmup start
   teacher_temp_end: 0.07       # standard DINO: linear 0.04 -> 0.07, then constant
@@ -41,7 +61,9 @@ synth_defect:
   enable: false
   n_events: [3, 8]             # nuisance PSF points per triplet, random presence combos
   defect_prob: 0.5             # chance of ONE true (target-only) defect on normal triplets
-  lambda: 0.1
+  missing_frac: 0.0            # only (target,ref1,ref2)=(1,0,0) is a defect
+  lambda: 0.1                  # bounded backbone-token margin loss weight
+  margin: 0.5                  # L2 distance after token L2 normalization (range 0..2)
   psf_sigma: [1.1, 1.7]        # footprint (>20% peak) ~ 3.6*sigma = 4.0-6.1 px
   psf_amplitude: [15, 80]      # gray levels; polarity is local-background-aware
 

@@ -4,7 +4,7 @@ Phases (config `phase`):
   0 - no training; evaluate frozen DINOv3 (baseline AUROC, the bar to beat).
   1 - triplet DINO (pairing table + patch loss + shared-geometry views).
   2 - + defect oversampling + robust top-k exemption.
-  3 - + synthetic-defect repulsion.
+  3 - + bounded synthetic-defect margin and order-aware target-only fusion head.
 
 Stock DINO stabilisation is kept: EMA teacher, centering, temperature, cosine LR + warmup.
 Backbone LR is small (continued pretraining) with layer-wise decay; heads train normally.
@@ -32,13 +32,17 @@ import torch.nn as nn
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from dinov3.models.vision_transformer import vit_base
 from dinov3.layers.dino_head import DINOHead
 from triplet_ssl.data.triplet_dataset import (
     TripletDataset, TiffTripletDataset, SharedGeomTripletAug,
     DefectOversampleBatchSampler, triplet_collate)
 from triplet_ssl.data.synth_defect import TripletSyntheticPSF, augmentation_survival_check
 from triplet_ssl.losses.triplet_loss import TripletLoss
+from triplet_ssl.models.order_aware_fusion import (
+    OrderAwareTripletFusionHead, select_safe_background_negatives,
+    target_unique_fusion_loss)
+from triplet_ssl.models.backbone import (
+    build_canonical_backbone, export_backbone_config, validate_backbone_config)
 from triplet_ssl.eval.separability import evaluate_separability, evaluate_guardrail
 from triplet_ssl.eval.plot_curves import plot_training_curves
 from triplet_ssl import IMG_MEAN, IMG_STD
@@ -79,21 +83,35 @@ class TripletStudent(nn.Module):
     submodules (backbone/heads) directly around a DDP wrapper breaks gradient
     bucketing. This container is what gets DDP-wrapped."""
 
-    def __init__(self, backbone, cls_head, patch_head):
+    def __init__(self, backbone, cls_head, patch_head, fusion_head=None):
         super().__init__()
         self.backbone = backbone
         self.cls_head = cls_head
         self.patch_head = patch_head
+        self.fusion_head = fusion_head
+
+    def _append_fusion(self, outputs, patch_tokens):
+        if self.fusion_head is None:
+            return outputs
+        if patch_tokens.shape[0] % 3:
+            raise ValueError("stacked triplet batch must contain exactly 3*B images")
+        # s_nat is stacked in NAMES order: ref1, ref2, target.
+        f1, f2, ft = patch_tokens.chunk(3, dim=0)
+        return outputs + (self.fusion_head(ft, f1, f2),)
 
     def forward(self, s_nat, s_loc=None):
         if s_loc is not None:
             f_nat, f_loc = self.backbone.forward_features([s_nat, s_loc],
                                                           masks=[None, None])
-            return (self.cls_head(f_loc["x_norm_clstoken"]),
-                    self.patch_head(f_nat["x_norm_patchtokens"]))
+            tok = f_nat["x_norm_patchtokens"]
+            outputs = (self.cls_head(f_loc["x_norm_clstoken"]),
+                       self.patch_head(tok), tok)
+            return self._append_fusion(outputs, tok)
         f = self.backbone.forward_features(s_nat)
-        return (self.cls_head(f["x_norm_clstoken"]),
-                self.patch_head(f["x_norm_patchtokens"]))
+        tok = f["x_norm_patchtokens"]
+        outputs = (self.cls_head(f["x_norm_clstoken"]),
+                   self.patch_head(tok), tok)
+        return self._append_fusion(outputs, tok)
 
 
 # --------------------------------------------------------------------------- #
@@ -124,21 +142,55 @@ def load_config(path):
 # Model
 # --------------------------------------------------------------------------- #
 def build_backbone(cfg, device):
-    return vit_base(patch_size=cfg["model"]["patch_size"],
-                    img_size=cfg["model"]["img_size"]).to(device)
+    if int(cfg["model"]["patch_size"]) != 16:
+        raise ValueError("canonical dinov3_vitb16 requires model.patch_size=16")
+    return build_canonical_backbone().to(device)
+
+
+def _extract_backbone_state(ckpt):
+    """Unwrap common DINO/DDP checkpoints into a backbone-only state dict."""
+    if not isinstance(ckpt, dict):
+        raise TypeError("checkpoint must contain a state-dict mapping")
+    state = ckpt
+    for key in ("teacher_backbone", "model", "teacher", "state_dict"):
+        if key in state and isinstance(state[key], dict):
+            state = state[key]
+            break
+    cleaned = {}
+    for key, value in state.items():
+        name = key
+        changed = True
+        while changed:
+            changed = False
+            for prefix in ("module.", "backbone."):
+                if name.startswith(prefix):
+                    name = name[len(prefix):]
+                    changed = True
+        cleaned[name] = value
+    return cleaned
 
 
 def load_checkpoint(backbone, ckpt_path):
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    state = ckpt
-    for k in ("model", "teacher", "teacher_backbone", "state_dict"):
-        if isinstance(state, dict) and k in state:
-            state = state[k]
-            break
-    state = {k.replace("backbone.", ""): v for k, v in state.items()}
+    if isinstance(ckpt, dict):
+        validate_backbone_config(ckpt.get("backbone_config"))
+    state = _extract_backbone_state(ckpt)
     msg = backbone.load_state_dict(state, strict=False)
-    print(f"[init] loaded {ckpt_path} (mimic={ckpt.get('mimic', False) if isinstance(ckpt, dict) else False}) "
-          f"missing={len(msg.missing_keys)} unexpected={len(msg.unexpected_keys)}")
+    if msg.missing_keys:
+        preview = msg.missing_keys[:8]
+        suffix = "..." if len(msg.missing_keys) > len(preview) else ""
+        raise ValueError(
+            "checkpoint does not fully initialize the training backbone; "
+            f"missing keys: {preview}{suffix}")
+    if msg.unexpected_keys:
+        preview = msg.unexpected_keys[:8]
+        suffix = "..." if len(msg.unexpected_keys) > len(preview) else ""
+        raise ValueError(
+            "checkpoint contains weights outside the canonical training backbone; "
+            f"unexpected keys: {preview}{suffix}")
+    print(f"[init] loaded {ckpt_path} "
+          f"(mimic={ckpt.get('mimic', False) if isinstance(ckpt, dict) else False}) "
+          f"missing=0 unexpected={len(msg.unexpected_keys)}")
 
 
 def build_head(cfg, out_dim):
@@ -147,9 +199,23 @@ def build_head(cfg, out_dim):
                     bottleneck_dim=m["head_bottleneck"], nlayers=m["head_nlayers"])
 
 
+def build_fusion_head(cfg):
+    fc = cfg.get("fusion_head", {})
+    if not fc.get("enable", False):
+        return None
+    return OrderAwareTripletFusionHead(
+        in_dim=768,
+        hidden_dim=int(fc.get("hidden_dim", 128)),
+        dropout=float(fc.get("dropout", 0.1)),
+        prior_prob=float(fc.get("prior_prob", 0.01)),
+    )
+
+
 def embed(backbone, cls_head, patch_head, x):
     feat = backbone.forward_features(x)
-    return cls_head(feat["x_norm_clstoken"]), patch_head(feat["x_norm_patchtokens"])
+    return (cls_head(feat["x_norm_clstoken"]),
+            patch_head(feat["x_norm_patchtokens"]),
+            feat["x_norm_patchtokens"])
 
 
 # --------------------------------------------------------------------------- #
@@ -225,6 +291,9 @@ def main():
     torch.manual_seed(cfg["seed"] + rank)
     np.random.seed(cfg["seed"] + rank)
     phase = cfg["phase"]
+    fusion_enabled = bool(cfg.get("fusion_head", {}).get("enable", False))
+    if fusion_enabled and not cfg["synth_defect"].get("enable", False):
+        raise ValueError("fusion_head.enable requires synth_defect.enable truth-table supervision")
     out_dir = Path(args.out_dir)
     if is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -245,12 +314,28 @@ def main():
     t_cls = copy.deepcopy(s_cls); t_patch = copy.deepcopy(s_patch)
     for h in (t_cls, t_patch): h.requires_grad_(False)
 
+    # The deployed fusion head follows the same EMA student->teacher path as the
+    # backbone, so checkpointed tokens and relation head stay distribution-aligned.
+    s_fusion = build_fusion_head(cfg)
+    if s_fusion is not None:
+        s_fusion = s_fusion.to(device)
+        t_fusion = copy.deepcopy(s_fusion).requires_grad_(False).eval()
+    else:
+        t_fusion = None
+
     # Student container behind one forward() (required for DDP), then wrap.
-    student = TripletStudent(student_bb, s_cls, s_patch).to(device)
+    student = TripletStudent(student_bb, s_cls, s_patch, s_fusion).to(device)
     if ddp:
         student = nn.parallel.DistributedDataParallel(
             student, device_ids=[local_rank] if torch.cuda.is_available() else None)
     core = student.module if ddp else student
+    # DDP broadcasts the wrapped student from rank 0.  Re-copy the EMA heads
+    # afterwards; per-rank augmentation seeds were intentionally different and
+    # would otherwise leave unwrapped teacher heads with different initial state.
+    t_cls.load_state_dict(core.cls_head.state_dict())
+    t_patch.load_state_dict(core.patch_head.state_dict())
+    if t_fusion is not None:
+        t_fusion.load_state_dict(core.fusion_head.state_dict())
 
     img_size, patch_size = cfg["model"]["img_size"], cfg["model"]["patch_size"]
 
@@ -272,6 +357,7 @@ def main():
         topk_pct=lc["topk_exempt"]["pct"] if lc["topk_exempt"]["enable"] else 0.0,
         weights=lc["weights"], cls_weight=lc["cls_weight"],
         repel_lambda=cfg["synth_defect"]["lambda"] if cfg["synth_defect"]["enable"] else 0.0,
+        repel_margin=cfg["synth_defect"].get("margin", 0.5),
     ).to(device)
 
     # -- Data ----------------------------------------------------------------
@@ -284,15 +370,19 @@ def main():
     synth = TripletSyntheticPSF(
         n_events=tuple(sd.get("n_events", (3, 8))),
         defect_prob=sd.get("defect_prob", 0.5),
+        missing_frac=sd.get("missing_frac", 0.0),
         psf_sigma=tuple(sd.get("psf_sigma", (1.1, 1.7))),
         psf_amplitude=tuple(sd.get("psf_amplitude", (15, 80))),
         defect_center_jitter=sd.get("defect_center_jitter"),
-        seed=cfg["seed"]) if sd["enable"] else None
+        seed=cfg["seed"] + rank) if sd["enable"] else None
     if dc.get("format", "folder") == "tiff3":
         train_ds = TiffTripletDataset(dc["root"], crop_size=dc.get("crop_size", 128),
                                       transform=aug, register=dc["register"],
                                       patch_size=patch_size, synth_defect=synth,
-                                      cls_local_size=dc.get("cls_local_size", 64))
+                                      channel_order=tuple(dc.get("channel_order", (0, 1, 2))),
+                                      cls_local_size=dc.get("cls_local_size", 64),
+                                      uint16_black_level=dc.get("uint16_black_level", 0),
+                                      uint16_white_level=dc.get("uint16_white_level", 65535))
         print(f"[data] tiff3: {len(train_ds)} TIFFs, native {dc.get('crop_size', 128)}px "
               f"window crop (no resize)")
     else:
@@ -319,7 +409,8 @@ def main():
                                          persistent_workers=(nw > 0))
 
     # -- Optimizer -----------------------------------------------------------
-    groups = param_groups_layerwise(student_bb, [s_cls, s_patch],
+    train_heads = [s_cls, s_patch] + ([s_fusion] if s_fusion is not None else [])
+    groups = param_groups_layerwise(student_bb, train_heads,
                                     cfg["optim"]["backbone_lr"], cfg["optim"]["head_lr"],
                                     cfg["optim"]["layerwise_decay"], cfg["optim"]["weight_decay"],
                                     n_blocks=len(student_bb.blocks))
@@ -363,32 +454,71 @@ def main():
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp_on):
             # One student forward through the DDP-wrapped container (both
             # resolutions via forward_features_list; heads applied selectively).
-            cs_all, ps_nat = student(s_nat, s_loc)
+            student_out = student(s_nat, s_loc)
+            if fusion_enabled:
+                cs_all, ps_nat, fs_nat, fusion_logits = student_out
+            else:
+                cs_all, ps_nat, fs_nat = student_out
+                fusion_logits = None
             with torch.no_grad():
-                ct_nat, pt_nat = embed(teacher_bb, t_cls, t_patch, t_nat)
+                ct_nat, pt_nat, ft_nat = embed(teacher_bb, t_cls, t_patch, t_nat)
 
             cls, patch = {}, {}
             for i, n in enumerate(NAMES):
                 sl = slice(i * B, (i + 1) * B)
                 cls[n] = dict(s=cs_all[sl], t=ct_nat[sl].detach())
-                patch[n] = dict(s=ps_nat[sl], t=pt_nat[sl].detach())
+                patch[n] = dict(s=ps_nat[sl], t=pt_nat[sl].detach(),
+                                s_feat=fs_nat[sl], t_feat=ft_nat[sl].detach())
 
             synth_mask = batch["synth_mask"].to(device) if "synth_mask" in batch else None
+            synth_event_mask = (batch["synth_event_mask"].to(device)
+                                if "synth_event_mask" in batch else None)
+            synth_unmatched_mask = (batch["synth_unmatched_mask"].to(device)
+                                    if "synth_unmatched_mask" in batch else synth_mask)
             # TR-CLS exemption: target KNOWN to contain a defect (image-level flag
             # or synthetic injection) -> drop that sample's target<->ref CLS pull.
             cls_exempt = batch["is_defect"].to(device).bool()
-            if synth_mask is not None:
-                cls_exempt = cls_exempt | (synth_mask.sum(dim=1) > 0)
+            if synth_unmatched_mask is not None:
+                cls_exempt = cls_exempt | (synth_unmatched_mask.sum(dim=1) > 0)
             loss, logs = triplet_loss(cls, patch, trad_key=NAMES[step % 3],
-                                      synth_mask=synth_mask, cls_exempt=cls_exempt)
+                                      synth_mask=synth_mask, cls_exempt=cls_exempt,
+                                      pull_exclude_mask=synth_unmatched_mask)
+            if fusion_enabled:
+                if synth_mask is None or synth_event_mask is None:
+                    raise RuntimeError(
+                        "fusion training requires synth_mask and synth_event_mask from the dataset")
+                fc = cfg["fusion_head"]
+                background_neg = select_safe_background_negatives(
+                    patch["target"]["s_feat"], patch["ref1"]["s_feat"],
+                    patch["ref2"]["s_feat"], synth_event_mask,
+                    fraction=float(fc.get("background_negative_frac", 0.25)))
+                fusion_raw, fusion_logs = target_unique_fusion_loss(
+                    fusion_logits, synth_mask, synth_event_mask, background_neg)
+                fwarm = int(fc.get("warmup_steps", 0))
+                warm_scale = min((step + 1) / max(fwarm, 1), 1.0) if fwarm > 0 else 1.0
+                fusion_weight = float(fc.get("loss_weight", 0.5)) * warm_scale
+                fusion_term = fusion_weight * fusion_raw
+                loss = loss + fusion_term
+                logs.update(fusion_logs)
+                logs["fusion_raw"] = float(fusion_raw.detach())
+                logs["fusion_loss"] = float(fusion_term.detach())
+                logs["fusion_weight"] = fusion_weight
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        nn.utils.clip_grad_norm_(
-            list(student_bb.parameters()) + list(s_cls.parameters()) + list(s_patch.parameters()), clip)
+        clip_params = (list(student_bb.parameters()) + list(s_cls.parameters())
+                       + list(s_patch.parameters()))
+        if s_fusion is not None:
+            clip_params += list(s_fusion.parameters())
+        nn.utils.clip_grad_norm_(clip_params, clip)
         opt.step()
         ema_update(student_bb, teacher_bb, mom)
         ema_update(s_cls, t_cls, mom); ema_update(s_patch, t_patch, mom)
+        if s_fusion is not None:
+            # The fusion head starts random (unlike the pretrained backbone), so
+            # the backbone's near-1 EMA would leave a short run mostly random.
+            fusion_mom = float(cfg["fusion_head"].get("ema_momentum", 0.9))
+            ema_update(s_fusion, t_fusion, fusion_mom)
 
         row = dict(step=step, loss=float(loss.detach()),
                    L_refref=logs["L_refref"], L_target2ref=logs["L_target2ref"],
@@ -396,10 +526,22 @@ def main():
                    teacher_temp=triplet_loss.teacher_temp, momentum=mom)
         if "repel" in logs:
             row["repel"] = logs["repel"]
+            row["synth_score"] = logs["synth_score"]
+        if "fusion_loss" in logs:
+            row.update(fusion_loss=logs["fusion_loss"],
+                       fusion_raw=logs["fusion_raw"],
+                       fusion_weight=logs["fusion_weight"],
+                       fusion_pos_score=logs["fusion_pos_score"],
+                       fusion_neg_score=logs["fusion_neg_score"])
         train_log.append(row)
 
         if is_main and (step % max(1, total // 10) == 0 or step == total - 1):
-            extra = f" repel={logs['repel']:.3f}" if "repel" in logs else ""
+            extra = (f" margin={logs['repel']:.3f} synth_score={logs['synth_score']:.3f}"
+                     if "repel" in logs else "")
+            if "fusion_loss" in logs:
+                extra += (f" fusion={logs['fusion_loss']:.3f}"
+                          f" p+={logs['fusion_pos_score']:.3f}"
+                          f" p-={logs['fusion_neg_score']:.3f}")
             print(f"step {step:04d}/{total} loss={loss.item():.4f} "
                   f"rr={logs['L_refref']:.3f} tr={logs['L_target2ref']:.3f} "
                   f"td={logs['L_trad']:.3f} lr={opt.param_groups[-1]['lr']:.2e}{extra}")
@@ -418,10 +560,34 @@ def main():
                                  core.patch_head, teacher_bb, t_cls, t_patch,
                                  train_ds, device, out_dir, phase)
 
-        torch.save({"teacher_backbone": teacher_bb.state_dict(), "phase": phase},
-                   out_dir / f"phase{phase}_teacher.pth")
+        checkpoint = {
+            "checkpoint_version": 2 if t_fusion is not None else 1,
+            "backbone_config": export_backbone_config(),
+            "teacher_backbone": teacher_bb.state_dict(),
+            "phase": phase,
+            "preprocess": {
+                "mean": list(IMG_MEAN),
+                "std": list(IMG_STD),
+                "input_scaling": "fixed_uint16_range_to_0_255_float_v1",
+                "uint16_black_level": float(dc.get("uint16_black_level", 0)),
+                "uint16_white_level": float(dc.get("uint16_white_level", 65535)),
+                "channel_order": ["target", "ref1", "ref2"],
+                "source_channel_indices": list(dc.get("channel_order", (0, 1, 2))),
+                "register": bool(dc.get("register", False)),
+            },
+        }
+        if t_fusion is not None:
+            train_tile = int(dc.get("crop_size", img_size))
+            checkpoint.update(
+                teacher_fusion_head=t_fusion.state_dict(),
+                student_fusion_head=s_fusion.state_dict(),
+                fusion_head_config=t_fusion.export_config(
+                    patch_size=patch_size, train_tile=train_tile),
+            )
+        torch.save(checkpoint, out_dir / f"phase{phase}_teacher.pth")
         _evaluate_and_report(teacher_bb, cfg, device, out_dir, phase,
-                             notes=f"phase{phase} adapted")
+                             notes=f"phase{phase} adapted",
+                             fusion_head=t_fusion)
     if ddp:
         dist.barrier()
         dist.destroy_process_group()
@@ -442,9 +608,9 @@ def _log_exempt_overlays(loss_mod, student_bb, s_cls, s_patch, teacher_bb, t_cls
     t_views = {n: batch[n][:, 1].to(device) for n in NAMES}
     patch = {}
     for n in NAMES:
-        _, ps_ = embed(student_bb, s_cls, s_patch, s_views[n])
-        _, pt_ = embed(teacher_bb, t_cls, t_patch, t_views[n])
-        patch[n] = dict(s=ps_, t=pt_)
+        _, ps_, fs_ = embed(student_bb, s_cls, s_patch, s_views[n])
+        _, pt_, ft_ = embed(teacher_bb, t_cls, t_patch, t_views[n])
+        patch[n] = dict(s=ps_, t=pt_, s_feat=fs_, t_feat=ft_)
 
     pp = student_bb.patch_size
     g = s_views["target"].shape[-1] // pp
@@ -465,28 +631,43 @@ def _log_exempt_overlays(loss_mod, student_bb, s_cls, s_patch, teacher_bb, t_cls
               f"-> phase{phase}_exempt_{tid}.png")
 
 
-def _evaluate_and_report(backbone, cfg, device, out_dir, phase, notes=""):
+def _evaluate_and_report(backbone, cfg, device, out_dir, phase, notes="",
+                         fusion_head=None):
     dc, ec, mc = cfg["data"], cfg["eval"], cfg["model"]
     eval_root = dc.get("eval_root") or dc["root"]
-    if dc.get("format", "folder") == "tiff3" and not dc.get("eval_root"):
-        print("[eval] skipped: tiff3 data has no GT masks. Set data.eval_root to a "
-              "folder-format eval split (<id>/{ref1,ref2,target,mask}.png + manifest) "
-              "to enable the separability gate.")
+    tiff_mode = dc.get("format", "folder") == "tiff3"
+    proxy_eval = tiff_mode and bool(dc.get("eval_root"))
+    if tiff_mode and not proxy_eval:
+        print("[eval] skipped: unlabelled TIFF data has no AUROC target. Use "
+              "infer.py --calib on held-out known-normal optical TIFFs.")
         return
+    if proxy_eval and not ec.get("allow_resized_folder_proxy", False):
+        print("[eval] skipped: a 224px resized folder eval does not match the native "
+              "TIFF tile context. Set eval.allow_resized_folder_proxy=true only "
+              "for an explicitly non-deployment proxy; use infer.py --calib for "
+              "the production path.")
+        return
+    if proxy_eval:
+        print("[eval] PROXY ONLY: resized folder/whole-image tokens do not match "
+              "native TIFF tiled deployment; AUROC will not be used as a gate.")
     rmode = ec.get("residual_mode", "mean")
     metrics = evaluate_separability(
         backbone, eval_root, dc["eval_split"], device,
         img_size=mc["img_size"], patch_size=mc["patch_size"],
         overlap_thresh=ec["overlap_thresh"], n_heatmaps=ec["n_heatmaps"],
         out_dir=str(out_dir / f"phase{phase}_heatmaps"), tag=f"phase{phase}",
-        residual_mode=rmode)
+        residual_mode=rmode, fusion_head=fusion_head)
     guard = evaluate_guardrail(backbone, eval_root, dc["eval_split"], device,
-                               img_size=mc["img_size"], residual_mode=rmode)
+                               img_size=mc["img_size"], residual_mode=rmode,
+                               fusion_head=fusion_head)
     metrics.update(guard)
 
     baseline_file = out_dir / "phase0_auroc.txt"
     have_baseline = baseline_file.exists()
-    if phase == 0:
+    metrics["deployment_gate_eligible"] = not proxy_eval
+    if proxy_eval:
+        delta = None
+    elif phase == 0:
         baseline_file.write_text(str(metrics["auroc"]))
         delta = 0.0
     elif have_baseline:
@@ -506,7 +687,9 @@ def _evaluate_and_report(backbone, cfg, device, out_dir, phase, notes=""):
         f.write(f"{phase}\t{metrics['auroc']:.4f}\t{metrics['defect_normal_ratio']:.3f}\t"
                 f"{metrics['guardrail_mean_res']:.4f}\t{notes}\n")
 
-    if phase == 0:
+    if proxy_eval:
+        gate_str = "  (proxy only; not a deployment gate)"
+    elif phase == 0:
         gate_str = "  (baseline)"
     elif delta is None:
         gate_str = "  (no phase-0 baseline in this --out-dir; run phase0 first)"

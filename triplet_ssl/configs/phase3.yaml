@@ -5,3 +5,4 @@ loss:
   topk_exempt: {enable: true, pct: 0.02}
 oversample: {enable: true, defect_frac: 0.15}
 synth_defect: {enable: true, n_events: [3, 8], defect_prob: 0.5, lambda: 0.1}
+fusion_head: {enable: true}

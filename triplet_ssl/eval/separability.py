@@ -84,6 +84,16 @@ def _residual(tg, r1, r2, mode="mean"):
     return torch.norm(tg - 0.5 * (r1 + r2), dim=-1)
 
 
+def _triplet_score(tg, r1, r2, mode="mean", fusion_head=None):
+    """Use the deployed scoring path when a trained fusion head is supplied."""
+    if fusion_head is None:
+        return _residual(tg, r1, r2, mode)
+    logits = fusion_head(tg.unsqueeze(0), r1.unsqueeze(0), r2.unsqueeze(0))
+    if logits.shape != (1, tg.shape[0]) or not torch.isfinite(logits).all():
+        raise RuntimeError("fusion head produced invalid evaluation logits")
+    return logits[0].sigmoid()
+
+
 def _mask_to_patch_labels(mask, grid, patch_size, overlap_thresh):
     m = mask[: grid * patch_size, : grid * patch_size]
     m = m.reshape(grid, patch_size, grid, patch_size).sum(axis=(1, 3))
@@ -108,9 +118,11 @@ def _heatmap(target_path, residual, grid, img_size, mask, out_path):
 @torch.no_grad()
 def evaluate_separability(backbone, root, split, device, img_size=224, patch_size=16,
                           overlap_thresh=0, n_heatmaps=10, out_dir=None, tag="phase",
-                          residual_mode="mean"):
+                          residual_mode="mean", fusion_head=None):
     """Returns a metrics dict. Writes heatmaps to out_dir if given."""
     backbone = backbone.to(device).eval()
+    if fusion_head is not None:
+        fusion_head = fusion_head.to(device).eval()
     root = Path(root) / split
     with open(root / "manifest.json") as f:
         items = json.load(f)
@@ -127,9 +139,12 @@ def evaluate_separability(backbone, root, split, device, img_size=224, patch_siz
         r1 = _patch_tokens(backbone, _load_norm(d / "ref1.png", img_size).to(device))
         r2 = _patch_tokens(backbone, _load_norm(d / "ref2.png", img_size).to(device))
         tg = _patch_tokens(backbone, _load_norm(d / "target.png", img_size).to(device))
-        residual = _residual(tg, r1, r2, residual_mode).cpu().numpy()        # (N,)
+        residual = _triplet_score(tg, r1, r2, residual_mode,
+                                  fusion_head).cpu().numpy()                 # (N,)
 
         mask = cv2.imread(str(d / "mask.png"), cv2.IMREAD_GRAYSCALE)         # GT: eval only
+        if mask.shape != (img_size, img_size):
+            mask = cv2.resize(mask, (img_size, img_size), interpolation=cv2.INTER_NEAREST)
         labels = _mask_to_patch_labels(mask, grid, patch_size, overlap_thresh)
 
         all_res.append(residual)
@@ -139,7 +154,8 @@ def evaluate_separability(backbone, root, split, device, img_size=224, patch_siz
 
         if out_dir and heatmaps_written < n_heatmaps and m["has_defect"]:
             _heatmap(d / "target.png", residual, grid, img_size, mask,
-                     Path(out_dir) / f"{tag}_{m['id']}_residual.png")
+                     Path(out_dir) / f"{tag}_{m['id']}_"
+                     f"{'fusion' if fusion_head is not None else 'residual'}.png")
             heatmaps_written += 1
 
     res = np.concatenate(all_res)
@@ -151,6 +167,8 @@ def evaluate_separability(backbone, root, split, device, img_size=224, patch_siz
     ratio = (def_res.mean() / (norm_res.mean() + 1e-8)) if def_res.size else float("nan")
     return dict(auroc=float(auroc), defect_normal_ratio=float(ratio),
                 residual_mode=residual_mode,
+                score_method="fusion" if fusion_head is not None else "residual",
+                evaluation_pipeline="resized_folder_eval",
                 mean_res_defect=float(def_res.mean()) if def_res.size else float("nan"),
                 mean_res_normal=float(norm_res.mean()),
                 n_defect_patches=int((lab == 1).sum()),
@@ -171,13 +189,17 @@ def evaluate_guardrail(backbone, root, split, device, **kw):
     backbone = backbone.to(device).eval()
     img_size = kw.get("img_size", 224)
     residual_mode = kw.get("residual_mode", "mean")
+    fusion_head = kw.get("fusion_head")
+    if fusion_head is not None:
+        fusion_head = fusion_head.to(device).eval()
     all_res = []
     for m in normals:
         d = root_p / m["id"]
         r1 = _patch_tokens(backbone, _load_norm(d / "ref1.png", img_size).to(device))
         r2 = _patch_tokens(backbone, _load_norm(d / "ref2.png", img_size).to(device))
         tg = _patch_tokens(backbone, _load_norm(d / "target.png", img_size).to(device))
-        all_res.append(_residual(tg, r1, r2, residual_mode).cpu().numpy())
+        all_res.append(_triplet_score(tg, r1, r2, residual_mode,
+                                      fusion_head).cpu().numpy())
     res = np.concatenate(all_res)
     return dict(guardrail_mean_res=float(res.mean()),
                 guardrail_p99_res=float(np.percentile(res, 99)), n=len(normals))

@@ -1,22 +1,32 @@
-"""Triplet DINO/iBOT loss: pairing table + robust top-k exemption + repulsion.
+"""Triplet DINO/iBOT loss: best-reference pull + bounded defect margin.
 
 Prototype projection uses dinov3's `DINOHead` (constructed in the training script and
 passed in via the model). Teacher sharpening uses centering (EMA), matching stock DINO;
 the cross-entropy is the exact `lossfunc` recipe from `dinov3.loss.ibot_patch_loss`.
 
-Pairing table (teacher <-> student), computed at CLS and PATCH level:
+Pairing table (teacher -> student), computed at CLS and PATCH level:
 
-  ref-ref     (w_ref2ref)     : t(ref1)<->s(ref2) + t(ref2)<->s(ref1)  -- full, NO exemption
-  target-ref  (w_target2ref)  : t(ref1)<->s(target) + t(ref2)<->s(target) -- robust top-k exempt
-  traditional (w_traditional) : t(img)<->s(img), img rotating over {target,ref1,ref2}
+  target-ref  (w_target2ref)  : target matches its BEST reference per token/sample
+                                (min loss over ref1/ref2), with robust top-k exemption
+  traditional (w_traditional) : same-image DINO pair, rotating over target/ref1/ref2
+
+There is intentionally NO unconditional ref1<->ref2 pull. A PSF may occur in only
+one reference and is still a nuisance; forcing a PSF-bearing reference to match a
+clean reference teaches the shared backbone to erase exactly the morphology needed
+for target-unique detection.
 
 Robust top-k exemption (target-ref patch term ONLY): per image, drop the top-k% highest
 per-patch losses before averaging. Defect patches legitimately cannot match the
-reference; forcing them to would collapse defect features into normality. NEVER applied
-to ref-ref.
+reference; forcing them to would collapse defect features into normality.
 
-Repulsion (phase 3): L_repel = -lambda * mean(per_patch_loss[synth_mask]) on the
-target-ref patch term -- actively pushes synthetic-defect patches away from the reference.
+Synthetic-defect separation (phase 3) is applied directly to L2-normalized backbone
+patch tokens, matching deployment. It is a bounded hinge:
+
+    L_margin = lambda * mean(relu(margin - min(d(target, ref1), d(target, ref2))))
+
+so the objective reaches zero once a target-only synthetic defect is sufficiently far
+from BOTH references. Unlike negative cross-entropy, it is bounded below and cannot
+decrease without limit by exploding projection-head logits.
 """
 
 import torch
@@ -33,15 +43,16 @@ def _ce_lastdim(student_logits, teacher_probs, temp):
 class TripletLoss(nn.Module):
     def __init__(self, cls_out_dim, patch_out_dim, student_temp=0.1, teacher_temp=0.04,
                  center_momentum=0.9, topk_pct=0.02, weights=None, repel_lambda=0.0,
-                 cls_weight=1.0):
+                 repel_margin=0.5, cls_weight=1.0):
         super().__init__()
         self.student_temp = student_temp
         self.teacher_temp = teacher_temp
         self.center_momentum = center_momentum
         self.topk_pct = topk_pct
         self.repel_lambda = repel_lambda
+        self.repel_margin = repel_margin
         self.cls_weight = cls_weight  # relative weight of CLS vs patch term
-        w = weights or dict(traditional=0.3, ref2ref=0.4, target2ref=0.3)
+        w = weights or dict(traditional=0.5, target2ref=0.5)
         self.w = w
         self.register_buffer("center_cls", torch.zeros(1, cls_out_dim))
         self.register_buffer("center_patch", torch.zeros(1, 1, patch_out_dim))
@@ -101,34 +112,37 @@ class TripletLoss(nn.Module):
         return (loss_bn * keep).sum() / keep.sum().clamp(min=1)
 
     def forward(self, cls, patch, trad_key="target", synth_mask=None,
-                cls_exempt=None):
+                cls_exempt=None, pull_exclude_mask=None):
         """cls[name] / patch[name] = dict(s=student_logits, t=teacher_logits).
 
-        name in {ref1, ref2, target}. cls logits (B,Kc); patch logits (B,N,Kp).
+        name in {ref1, ref2, target}. cls logits (B,Kc). Each patch entry has
+        projection logits s/t (B,N,Kp) and normalized-backbone inputs s_feat/t_feat
+        (B,N,D); the feature tensors are used only by the bounded synthetic margin.
         cls_exempt: optional (B,) bool -- samples whose target is KNOWN to contain
         a defect (synthetic injection or has_defect flag). Their target<->ref CLS
         term is dropped entirely: pulling a defect-bearing global feature toward a
-        defect-free reference is CLS-level normality collapse. RR/TD CLS are
-        unaffected (refs are clean; the same-image pair is consistent either way).
+        defect-free reference is CLS-level normality collapse. Same-image CLS is
+        unaffected.
         Returns (total_loss, log_dict).
         """
         logs = {}
 
-        # 1. ref-ref : full consistency, no exemption --------------------------
-        rr_patch = 0.5 * (self._patch_per_patch(patch["ref2"]["s"], patch["ref1"]["t"]).mean()
-                          + self._patch_per_patch(patch["ref1"]["s"], patch["ref2"]["t"]).mean())
-        rr_cls = 0.5 * (self._cls_pair(cls["ref2"]["s"], cls["ref1"]["t"])
-                        + self._cls_pair(cls["ref1"]["s"], cls["ref2"]["t"]))
-        L_rr = rr_patch + self.cls_weight * rr_cls
-
-        # 2. target-ref : robust top-k exemption on the patch term -------------
-        tr_pp = 0.5 * (self._patch_per_patch(patch["target"]["s"], patch["ref1"]["t"])
-                       + self._patch_per_patch(patch["target"]["s"], patch["ref2"]["t"]))  # (B,N)
+        # 1. target-ref: match the BEST reference per patch. A nuisance shared by
+        # target and either reference therefore stays normal; target-only content
+        # differs from both and remains eligible for exemption / synthetic margin.
+        tr1_pp = self._patch_per_patch(patch["target"]["s"], patch["ref1"]["t"])
+        tr2_pp = self._patch_per_patch(patch["target"]["s"], patch["ref2"]["t"])
+        tr_pp = torch.minimum(tr1_pp, tr2_pp)  # (B,N)
         # Known synthetic-defect patches are excluded from the pull (mask-certain),
         # on top of the statistical top-k exemption for unlabeled real defects.
-        tr_patch = self._robust_mean(tr_pp, self.topk_pct, exclude_mask=synth_mask)
-        tr_cls_ps = 0.5 * (self._cls_pair_per_sample(cls["target"]["s"], cls["ref1"]["t"])
-                           + self._cls_pair_per_sample(cls["target"]["s"], cls["ref2"]["t"]))
+        # Besides target-only 100 positives, synthetic 011 sites also have no
+        # legal best-reference match. Pulling target-background toward two
+        # PSF-bearing refs would erase the signed direction the fusion head needs.
+        exclude_mask = pull_exclude_mask if pull_exclude_mask is not None else synth_mask
+        tr_patch = self._robust_mean(tr_pp, self.topk_pct, exclude_mask=exclude_mask)
+        tr1_cls = self._cls_pair_per_sample(cls["target"]["s"], cls["ref1"]["t"])
+        tr2_cls = self._cls_pair_per_sample(cls["target"]["s"], cls["ref2"]["t"])
+        tr_cls_ps = torch.minimum(tr1_cls, tr2_cls)
         if cls_exempt is not None and cls_exempt.any():
             keep = ~cls_exempt.bool()
             tr_cls = tr_cls_ps[keep].mean() if keep.any() else tr_cls_ps.sum() * 0.0
@@ -136,20 +150,28 @@ class TripletLoss(nn.Module):
             tr_cls = tr_cls_ps.mean()
         L_tr = tr_patch + self.cls_weight * tr_cls
 
-        # 3. traditional same-image pair (rotating) ----------------------------
+        # 2. traditional same-image pair (rotating) ----------------------------
         td_patch = self._patch_per_patch(patch[trad_key]["s"], patch[trad_key]["t"]).mean()
         td_cls = self._cls_pair(cls[trad_key]["s"], cls[trad_key]["t"])
         L_td = td_patch + self.cls_weight * td_cls
 
-        total = (self.w["ref2ref"] * L_rr + self.w["target2ref"] * L_tr
-                 + self.w["traditional"] * L_td)
+        total = self.w["target2ref"] * L_tr + self.w["traditional"] * L_td
 
-        # Repulsion (phase 3): push synthetic-defect patches away from refs.
+        # Phase 3: bounded margin directly on the backbone tokens used at
+        # inference. min(distance-to-refs) >= margin means the target token is
+        # sufficiently different from BOTH references and the penalty is zero.
         if self.repel_lambda > 0 and synth_mask is not None and synth_mask.sum() > 0:
             m = synth_mask.bool()
-            repel = -self.repel_lambda * tr_pp[m].mean()
+            ft = F.normalize(patch["target"]["s_feat"], dim=-1)
+            f1 = F.normalize(patch["ref1"]["t_feat"].detach(), dim=-1)
+            f2 = F.normalize(patch["ref2"]["t_feat"].detach(), dim=-1)
+            score = torch.minimum(torch.linalg.vector_norm(ft - f1, dim=-1),
+                                  torch.linalg.vector_norm(ft - f2, dim=-1))
+            margin_penalty = F.relu(self.repel_margin - score[m]).mean()
+            repel = self.repel_lambda * margin_penalty
             total = total + repel
             logs["repel"] = float(repel.detach())
+            logs["synth_score"] = float(score[m].mean().detach())
 
         # Standard DINO order: losses use the OLD center; update centers afterwards.
         self._update_centers(
@@ -157,7 +179,7 @@ class TripletLoss(nn.Module):
             torch.cat([patch[n]["t"] for n in ("ref1", "ref2", "target")], 0),
         )
 
-        logs.update(L_refref=float(L_rr.detach()), L_target2ref=float(L_tr.detach()),
+        logs.update(L_refref=0.0, L_target2ref=float(L_tr.detach()),
                     L_trad=float(L_td.detach()),
                     exempt_pct=self.topk_pct)
         if cls_exempt is not None:
@@ -168,8 +190,10 @@ class TripletLoss(nn.Module):
     def exempted_patch_map(self, patch, sample_idx=0):
         """For sanity logging: which patches would be exempted on target-ref (the
         highest-loss top-k%). Returns a boolean (N,) map for one sample."""
-        tr_pp = 0.5 * (self._patch_per_patch(patch["target"]["s"], patch["ref1"]["t"])
-                       + self._patch_per_patch(patch["target"]["s"], patch["ref2"]["t"]))
+        tr_pp = torch.minimum(
+            self._patch_per_patch(patch["target"]["s"], patch["ref1"]["t"]),
+            self._patch_per_patch(patch["target"]["s"], patch["ref2"]["t"]),
+        )
         loss_n = tr_pp[sample_idx]
         N = loss_n.numel()
         k = int(N * self.topk_pct)

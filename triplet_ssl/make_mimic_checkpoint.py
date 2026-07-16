@@ -21,7 +21,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from dinov3.models.vision_transformer import vit_base
+from triplet_ssl.models.backbone import build_canonical_backbone, export_backbone_config
 
 
 def main():
@@ -31,13 +31,16 @@ def main():
     ap.add_argument("--img_size", type=int, default=224)
     args = ap.parse_args()
 
-    model = vit_base(patch_size=args.patch_size, img_size=args.img_size)
+    if args.patch_size != 16 or args.img_size != 224:
+        raise ValueError("canonical dinov3_vitb16 mimic requires patch_size=16,img_size=224")
+    model = build_canonical_backbone()
     model.init_weights()  # proper trunc-normal init, not left uninitialised
 
     state = {f"backbone.{k}": v for k, v in model.state_dict().items()}
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model": state, "mimic": True}, out)
+    torch.save({"model": state, "mimic": True,
+                "backbone_config": export_backbone_config()}, out)
     n = sum(v.numel() for v in model.state_dict().values())
     print(f"Wrote MIMIC checkpoint ({n:,} params) -> {out}")
     print("NOTE: random weights. Replace with official DINOv3 ViT-B/16 for real runs.")

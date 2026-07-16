@@ -22,6 +22,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True, help="directory of 3-channel TIFFs")
     ap.add_argument("--max-files", type=int, default=500)
+    ap.add_argument("--uint16-black-level", type=float, default=0.0)
+    ap.add_argument("--uint16-white-level", type=float, default=65535.0,
+                    help="set 4095 for right-aligned 12-bit acquisition")
     args = ap.parse_args()
 
     files = sorted(list(Path(args.input).glob("*.tif"))
@@ -33,13 +36,17 @@ def main():
     # (target/ref are the same population), single mean/std replicated x3.
     s = ss = n = 0.0
     for f in files:
-        for img in read_tiff3(f):                      # target, ref1, ref2
+        for img in read_tiff3(
+                f, uint16_black_level=args.uint16_black_level,
+                uint16_white_level=args.uint16_white_level):  # target, ref1, ref2
             g = img[:, :, 0].astype(np.float64)        # channels identical
             s += g.sum(); ss += (g ** 2).sum(); n += g.size
     mean = s / n
     std = float(np.sqrt(ss / n - mean ** 2))
 
     print(f"files: {len(files)}  pixels: {int(n):,}")
+    print(f"uint16 mapping: black={args.uint16_black_level:g} "
+          f"white={args.uint16_white_level:g} -> float32 0..255")
     print(f"mean = {mean:.2f}   std = {std:.2f}")
     print("\npaste into triplet_ssl/__init__.py:")
     print(f"IMG_MEAN = ({mean:.2f}, {mean:.2f}, {mean:.2f})")
