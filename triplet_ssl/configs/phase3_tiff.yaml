@@ -18,3 +18,5 @@ oversample: {enable: false}        # tiff 模式沒有真缺陷旗標,關閉
 # Fusion 使用完整 128px native view，不需要把 defect 限制在 CLS local crop 中。
 synth_defect: {enable: true, n_events: [2, 5], defect_prob: 0.5, lambda: 0.1}
 fusion_head: {enable: true}
+# 啟用人工座標 validation 時傳入 --val-root <test TIFF 目錄>。每張檔名需以
+# #x,y 結尾；每 10 steps 用正式 tile/halo fusion inference 跑完整目錄並更新 best。

@@ -113,6 +113,8 @@ def load_inference_bundle(ckpt_path, device, *, backbone_factory=None):
     metadata = {
         "checkpoint_version": int(ckpt.get("checkpoint_version", 1)),
         "phase": ckpt.get("phase"),
+        "global_step": ckpt.get("global_step"),
+        "validation": ckpt.get("validation"),
         "preprocess": ckpt.get("preprocess"),
     }
     if not have_state and metadata["preprocess"] is None:
@@ -579,6 +581,8 @@ def main():
         calibration = {
             "checkpoint": str(args.checkpoint),
             "checkpoint_version": bundle_meta.get("checkpoint_version"),
+            "checkpoint_global_step": bundle_meta.get("global_step"),
+            "checkpoint_validation": bundle_meta.get("validation"),
             "effective_method": method,
             "score_semantics": ("sigmoid(target_unique_logit)" if method == "fusion"
                                 else tag_m),
@@ -618,6 +622,8 @@ def main():
     (out / "inference_metadata.json").write_text(json.dumps({
         "checkpoint": str(args.checkpoint),
         "checkpoint_version": bundle_meta.get("checkpoint_version"),
+        "checkpoint_global_step": bundle_meta.get("global_step"),
+        "checkpoint_validation": bundle_meta.get("validation"),
         "requested_method": args.method,
         "effective_method": method,
         "threshold": args.threshold,

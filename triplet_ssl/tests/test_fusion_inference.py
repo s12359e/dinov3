@@ -87,6 +87,7 @@ class FusionInferenceTest(unittest.TestCase):
             np.testing.assert_allclose(
                 [target[0, 0, 0], ref1[0, 0, 0], ref2[0, 0, 0]],
                 [203.875, 17.125, 91.5])
+
             scores, _, hw, _ = score_map(
                 FakeBackbone(), chw_path, torch.device("cpu"), tile=128,
                 context_halo=32, chunk=16, method="fusion",
@@ -244,6 +245,8 @@ class FusionInferenceTest(unittest.TestCase):
                 "register": False,
             },
             "phase": 3,
+            "global_step": 20,
+            "validation": {"top5_hit_rate": 0.875, "match_radius_px": 15.0},
         }
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "deploy.pth"
@@ -256,6 +259,8 @@ class FusionInferenceTest(unittest.TestCase):
         self.assertEqual(meta["preprocess"]["uint16_white_level"], 4095)
         self.assertEqual(meta["preprocess"]["mean"], [11.0, 12.0, 13.0])
         self.assertEqual(meta["preprocess"]["source_dtype"], "float32")
+        self.assertEqual(meta["global_step"], 20)
+        self.assertEqual(meta["validation"]["top5_hit_rate"], 0.875)
 
     def test_uint16_tiff_uses_explicit_sensor_range(self):
         values = (np.arange(16, dtype=np.uint16).reshape(4, 4) * 273)

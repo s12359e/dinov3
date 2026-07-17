@@ -12,7 +12,7 @@ Backbone LR is small (continued pretraining) with layer-wise decay; heads train 
 Init is ALWAYS from a DINOv3 checkpoint (mimic weights until real ones are placed);
 `--checkpoint` swaps in real weights with no code change.
 
-GT masks are read only by `triplet_ssl.eval.separability` (never in the training path).
+GT masks/filename point labels are read only by evaluation modules and never enter a loss.
 """
 
 import argparse
@@ -22,6 +22,7 @@ import math
 import os
 import sys
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import cv2
@@ -43,6 +44,8 @@ from triplet_ssl.models.order_aware_fusion import (
     target_unique_fusion_loss)
 from triplet_ssl.models.backbone import (
     build_canonical_backbone, export_backbone_config, validate_backbone_config)
+from triplet_ssl.eval.labeled_tiff import (
+    evaluate_labeled_tiffs, parse_point_label, validation_selection_key)
 from triplet_ssl.eval.separability import evaluate_separability, evaluate_guardrail
 from triplet_ssl.eval.plot_curves import plot_training_curves
 from triplet_ssl import IMG_MEAN, IMG_STD
@@ -53,7 +56,7 @@ NAMES = ("ref1", "ref2", "target")
 # --------------------------------------------------------------------------- #
 # Distributed (torchrun --nproc_per_node=N)
 # --------------------------------------------------------------------------- #
-def setup_distributed():
+def setup_distributed(timeout_minutes=120):
     """Init from torchrun env. Returns local_rank, or None for single-process.
 
     nccl on CUDA (H200s), gloo on CPU. DDP_INIT_FILE escape hatch: Windows
@@ -61,15 +64,20 @@ def setup_distributed():
     to a shared temp path and launch the ranks manually to smoke-test DDP."""
     if "RANK" not in os.environ:
         return None
+    timeout_minutes = float(timeout_minutes)
+    if not np.isfinite(timeout_minutes) or timeout_minutes <= 0:
+        raise ValueError("distributed.timeout_minutes must be positive and finite")
+    process_timeout = timedelta(minutes=timeout_minutes)
     backend = "nccl" if torch.cuda.is_available() else "gloo"
     init_file = os.environ.get("DDP_INIT_FILE")
     if init_file:
         dist.init_process_group(backend=backend,
                                 init_method=f"file:///{Path(init_file).as_posix()}",
                                 rank=int(os.environ["RANK"]),
-                                world_size=int(os.environ["WORLD_SIZE"]))
+                                world_size=int(os.environ["WORLD_SIZE"]),
+                                timeout=process_timeout)
     else:
-        dist.init_process_group(backend=backend)
+        dist.init_process_group(backend=backend, timeout=process_timeout)
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
@@ -258,6 +266,108 @@ def lr_factor(step, total, warmup):
     return 0.5 * (1 + math.cos(math.pi * min(prog, 1.0)))
 
 
+def _deployment_checkpoint(teacher_bb, t_fusion, s_fusion, train_ds, dc,
+                           phase, img_size, patch_size, *, global_step=None,
+                           validation=None):
+    """Build the strict inference bundle used for final and best checkpoints."""
+    source_dtype = getattr(train_ds, "source_dtype", "uint8")
+    if source_dtype == "uint16":
+        input_scaling = "fixed_uint16_range_to_0_255_float_v1"
+    elif source_dtype == "uint8":
+        input_scaling = "uint8_0_255_identity_v1"
+    elif source_dtype.startswith("float"):
+        input_scaling = "float_0_255_identity_v1"
+    else:
+        raise ValueError(f"unsupported training TIFF dtype for deployment: {source_dtype}")
+
+    checkpoint = {
+        "checkpoint_version": 2 if t_fusion is not None else 1,
+        "backbone_config": export_backbone_config(),
+        "teacher_backbone": teacher_bb.state_dict(),
+        "phase": phase,
+        "preprocess": {
+            "mean": list(IMG_MEAN),
+            "std": list(IMG_STD),
+            "input_scaling": input_scaling,
+            "source_dtype": source_dtype,
+            "source_layout": getattr(train_ds, "source_layout", "folder_hwc"),
+            "sample_format": getattr(train_ds, "sample_format", None),
+            "supported_tiff_layouts": ["YXS", "SYX", "3PAGE_YX"],
+            "uint16_black_level": float(dc.get("uint16_black_level", 0)),
+            "uint16_white_level": float(dc.get("uint16_white_level", 65535)),
+            "channel_order": ["target", "ref1", "ref2"],
+            "source_channel_indices": list(dc.get("channel_order", (0, 1, 2))),
+            "register": bool(dc.get("register", False)),
+        },
+    }
+    if global_step is not None:
+        checkpoint["global_step"] = int(global_step)
+    if validation is not None:
+        checkpoint["validation"] = copy.deepcopy(validation)
+    if t_fusion is not None:
+        train_tile = int(dc.get("crop_size", img_size))
+        checkpoint.update(
+            teacher_fusion_head=t_fusion.state_dict(),
+            student_fusion_head=s_fusion.state_dict(),
+            fusion_head_config=t_fusion.export_config(
+                patch_size=patch_size, train_tile=train_tile),
+        )
+    return checkpoint
+
+
+def _atomic_torch_save(payload, path):
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def _atomic_json_save(payload, path):
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _validate_and_update_best(
+        teacher_bb, t_fusion, s_fusion, train_ds, dc, phase, img_size,
+        patch_size, step, val_root, device, val_score_kwargs, val_top_k,
+        val_radius, val_coordinate_base, out_dir, best_val_key):
+    """Run native point validation and atomically update reports/best bundle."""
+    validation = evaluate_labeled_tiffs(
+        teacher_bb, t_fusion, val_root, device,
+        score_kwargs=val_score_kwargs, top_k=val_top_k,
+        match_radius_px=val_radius, coordinate_base=val_coordinate_base)
+    summary = validation["summary"]
+    summary["global_step"] = int(step)
+    summary["selection_rule"] = (
+        "top5_hit_rate_then_top1_hit_rate_then_lower_mean_min_distance")
+    validation["summary"] = summary
+
+    step_report = out_dir / f"phase{phase}_val_step{step:06d}.json"
+    _atomic_json_save(validation, step_report)
+    _atomic_json_save(validation, out_dir / f"phase{phase}_val_latest.json")
+
+    candidate_key = validation_selection_key(summary)
+    improved = best_val_key is None or candidate_key > best_val_key
+    print(f"[val] step={step} top5={summary['top5_hit_count']}/"
+          f"{summary['n_images']} ({summary['top5_hit_rate']:.4f}) "
+          f"top1={summary['top1_hit_rate']:.4f} "
+          f"mean_dist={summary['mean_min_distance']:.3f}px"
+          f"{'  NEW BEST' if improved else ''}")
+    if improved:
+        best_val_key = candidate_key
+        best_checkpoint = _deployment_checkpoint(
+            teacher_bb, t_fusion, s_fusion, train_ds, dc, phase,
+            img_size, patch_size, global_step=step, validation=summary)
+        best_path = out_dir / f"phase{phase}_best.pth"
+        _atomic_torch_save(best_checkpoint, best_path)
+        _atomic_json_save(
+            validation, out_dir / f"phase{phase}_best_validation.json")
+        print(f"[checkpoint] best EMA deployment bundle -> {best_path}")
+    return copy.deepcopy(summary), best_val_key
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -266,6 +376,8 @@ def main():
     ap.add_argument("--config", required=True)
     ap.add_argument("--checkpoint", default=None, help="override cfg checkpoint (real weights)")
     ap.add_argument("--data-root", default=None)
+    ap.add_argument("--val-root", default=None,
+                    help="labeled TIFF directory; each stem ends in #x,y")
     ap.add_argument("--out-dir", default="triplet_ssl/runs")
     ap.add_argument("--num-steps", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=None)
@@ -275,10 +387,12 @@ def main():
     cfg = load_config(args.config)
     if args.checkpoint: cfg["checkpoint"] = args.checkpoint
     if args.data_root: cfg["data"]["root"] = args.data_root
+    if args.val_root: cfg.setdefault("eval", {})["labeled_tiff_root"] = args.val_root
     if args.num_steps is not None: cfg["optim"]["num_steps"] = args.num_steps
     if args.batch_size is not None: cfg["optim"]["batch_size"] = args.batch_size
 
-    local_rank = setup_distributed()
+    local_rank = setup_distributed(
+        cfg.get("distributed", {}).get("timeout_minutes", 120))
     ddp = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if ddp else 0
     world = dist.get_world_size() if ddp else 1
@@ -419,6 +533,8 @@ def main():
 
     # -- Train loop ----------------------------------------------------------
     total = cfg["optim"]["num_steps"]; warmup = cfg["optim"]["warmup_steps"]
+    if total <= 0:
+        raise ValueError("optim.num_steps must be positive")
     mom0 = cfg["optim"]["momentum_teacher"]
     mom_final = cfg["optim"].get("momentum_teacher_final", 1.0)
     clip = cfg["optim"]["grad_clip"]
@@ -427,8 +543,66 @@ def main():
     tt_end = lc.get("teacher_temp_end", tt_start)
     tt_warm = max(1, int(lc.get("teacher_temp_warmup_frac", 0.3) * total))
     amp_on = bool(cfg["optim"].get("amp", False)) and device.type == "cuda"
+
+    # Native labeled-TIFF validation uses the exact deployment score_map path.
+    # The directory is logically validation data even if its on-disk name is
+    # "test", because its labels are consulted repeatedly to select a model.
+    ec = cfg.get("eval", {})
+    val_root = ec.get("labeled_tiff_root")
+    val_score_kwargs = None
+    val_every = None
+    val_top_k = int(ec.get("top_k", 5))
+    val_radius = float(ec.get("match_radius_px", 15.0))
+    val_coordinate_base = int(ec.get("coordinate_base", 0))
+    if val_root:
+        if t_fusion is None:
+            raise ValueError("labeled TIFF best-model validation requires fusion_head.enable=true")
+        val_root = Path(val_root)
+        if not val_root.is_dir():
+            raise FileNotFoundError(f"labeled TIFF validation directory not found: {val_root}")
+        val_files = sorted(
+            path for path in val_root.iterdir()
+            if path.is_file() and path.suffix.lower() in {".tif", ".tiff"})
+        if not val_files:
+            raise FileNotFoundError(f"no .tif/.tiff under labeled validation root {val_root}")
+        for val_path in val_files:
+            parse_point_label(val_path, coordinate_base=val_coordinate_base)
+        val_every = int(ec.get("every_steps", max(1, total // 10)))
+        if val_every <= 0:
+            raise ValueError("eval.every_steps must be positive when labeled validation is enabled")
+        if val_top_k != 5:
+            raise ValueError("this validation contract requires eval.top_k=5")
+        if not np.isfinite(val_radius) or val_radius <= 0:
+            raise ValueError("eval.match_radius_px must be positive and finite")
+        train_tile = int(dc.get("crop_size", img_size))
+        fusion_contract = t_fusion.export_config(
+            patch_size=patch_size, train_tile=train_tile)
+        val_chunk = int(ec.get("tiff_chunk", 1))
+        if val_chunk <= 0:
+            raise ValueError("eval.tiff_chunk must be positive")
+        val_score_kwargs = {
+            "tile": train_tile,
+            "register": bool(dc.get("register", False)),
+            "patch": patch_size,
+            "chunk": val_chunk,
+            "method": "fusion",
+            "channel_order": tuple(dc.get("channel_order", (0, 1, 2))),
+            "uint16_black_level": float(dc.get("uint16_black_level", 0)),
+            "uint16_white_level": float(dc.get("uint16_white_level", 65535)),
+            "normalization_mean": IMG_MEAN,
+            "normalization_std": IMG_STD,
+            "context_halo": int(fusion_contract["inference_context_halo"]),
+            "uint16_decode_mode": "float_linear",
+            "expected_dtype": getattr(train_ds, "source_dtype", None),
+        }
+        if is_main:
+            print(f"[val] {len(val_files)} labeled TIFFs from {val_root}; "
+                  f"top-5 center match distance < {val_radius:g}px every {val_every} steps")
+
     student.train()
     train_log = []
+    best_val_key = None
+    last_val_summary = None
     t0 = time.time()
     for step, batch in enumerate(loader):
         f = lr_factor(step, total, warmup)
@@ -546,11 +720,40 @@ def main():
                   f"rr={logs['L_refref']:.3f} tr={logs['L_target2ref']:.3f} "
                   f"td={logs['L_trad']:.3f} lr={opt.param_groups[-1]['lr']:.2e}{extra}")
 
+        should_validate = bool(val_root) and (
+            (step + 1) % val_every == 0 or step == total - 1)
+        if should_validate:
+            # Non-main ranks wait in this broadcast while rank 0 validates.  A
+            # handled rank-0 error is broadcast too, so peers fail promptly
+            # instead of hanging in a barrier until the process-group timeout.
+            validation_status = torch.ones(1, dtype=torch.int32, device=device)
+            validation_error = None
+            if is_main:
+                try:
+                    last_val_summary, best_val_key = _validate_and_update_best(
+                        teacher_bb, t_fusion, s_fusion, train_ds, dc, phase,
+                        img_size, patch_size, step + 1, val_root, device,
+                        val_score_kwargs, val_top_k, val_radius,
+                        val_coordinate_base, out_dir, best_val_key)
+                    row.update(
+                        val_top5_hit_rate=last_val_summary["top5_hit_rate"],
+                        val_top1_hit_rate=last_val_summary["top1_hit_rate"],
+                        val_mean_min_distance=last_val_summary["mean_min_distance"])
+                except Exception as error:
+                    validation_error = error
+                    validation_status.zero_()
+            if ddp:
+                dist.broadcast(validation_status, src=0)
+            if not bool(validation_status.item()):
+                if validation_error is not None:
+                    raise validation_error
+                raise RuntimeError("rank 0 labeled TIFF validation failed; see rank 0 error")
+
     if is_main:
         print(f"[train] {total} steps in {time.time() - t0:.1f}s")
 
         # -- Training curves --------------------------------------------------
-        (out_dir / f"phase{phase}_train_log.json").write_text(json.dumps(train_log))
+        _atomic_json_save(train_log, out_dir / f"phase{phase}_train_log.json")
         plot_training_curves(train_log, out_dir / f"phase{phase}_curves.png")
         print(f"[curves] -> {out_dir / f'phase{phase}_curves.png'}")
 
@@ -560,44 +763,13 @@ def main():
                                  core.patch_head, teacher_bb, t_cls, t_patch,
                                  train_ds, device, out_dir, phase)
 
-        source_dtype = getattr(train_ds, "source_dtype", "uint8")
-        if source_dtype == "uint16":
-            input_scaling = "fixed_uint16_range_to_0_255_float_v1"
-        elif source_dtype == "uint8":
-            input_scaling = "uint8_0_255_identity_v1"
-        elif source_dtype.startswith("float"):
-            input_scaling = "float_0_255_identity_v1"
-        else:
-            raise ValueError(f"unsupported training TIFF dtype for deployment: {source_dtype}")
-        checkpoint = {
-            "checkpoint_version": 2 if t_fusion is not None else 1,
-            "backbone_config": export_backbone_config(),
-            "teacher_backbone": teacher_bb.state_dict(),
-            "phase": phase,
-            "preprocess": {
-                "mean": list(IMG_MEAN),
-                "std": list(IMG_STD),
-                "input_scaling": input_scaling,
-                "source_dtype": source_dtype,
-                "source_layout": getattr(train_ds, "source_layout", "folder_hwc"),
-                "sample_format": getattr(train_ds, "sample_format", None),
-                "supported_tiff_layouts": ["YXS", "SYX", "3PAGE_YX"],
-                "uint16_black_level": float(dc.get("uint16_black_level", 0)),
-                "uint16_white_level": float(dc.get("uint16_white_level", 65535)),
-                "channel_order": ["target", "ref1", "ref2"],
-                "source_channel_indices": list(dc.get("channel_order", (0, 1, 2))),
-                "register": bool(dc.get("register", False)),
-            },
-        }
-        if t_fusion is not None:
-            train_tile = int(dc.get("crop_size", img_size))
-            checkpoint.update(
-                teacher_fusion_head=t_fusion.state_dict(),
-                student_fusion_head=s_fusion.state_dict(),
-                fusion_head_config=t_fusion.export_config(
-                    patch_size=patch_size, train_tile=train_tile),
-            )
-        torch.save(checkpoint, out_dir / f"phase{phase}_teacher.pth")
+        checkpoint = _deployment_checkpoint(
+            teacher_bb, t_fusion, s_fusion, train_ds, dc, phase,
+            img_size, patch_size, global_step=total,
+            validation=last_val_summary)
+        final_path = out_dir / f"phase{phase}_teacher.pth"
+        _atomic_torch_save(checkpoint, final_path)
+        print(f"[checkpoint] final EMA deployment bundle -> {final_path}")
         _evaluate_and_report(teacher_bb, cfg, device, out_dir, phase,
                              notes=f"phase{phase} adapted",
                              fusion_head=t_fusion)

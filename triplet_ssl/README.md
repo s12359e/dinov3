@@ -214,6 +214,9 @@ layer-wise decay 0.9),head LR 正常(1e-3)。
 | `optim.backbone_lr` | 1e-5 | 持續預訓練用小 LR |
 | `optim.num_steps` | 60 | 訓練步數(正式訓練請加大)|
 | `eval.overlap_thresh` | 0 | patch 標成缺陷的 GT 重疊門檻(0=碰到就算)|
+| `eval.every_steps` | 10 | 有 `--val-root` 時每幾步跑完整 native TIFF validation |
+| `eval.top_k` | 5 | 每張圖取最強的 patch-center 候選數；目前契約固定為 5 |
+| `eval.match_radius_px` | 15 | GT 與候選的歐氏距離嚴格 `<15px` 才算命中 |
 | `separability_gate.min_auroc_delta` | 0.0 | 過關門檻(AUROC 需 ≥ Phase0 + 此值)|
 
 ---
@@ -229,6 +232,9 @@ layer-wise decay 0.9),head LR 正常(1e-3)。
 | `phaseN_train_log.json` | 每步數值(可重繪曲線)|
 | `phaseN_exempt_*.png` | top-k 豁免的 patch 紅框疊圖(Phase 2+)— **紅框應落在缺陷區**,這是 top-k 有沒有咬對的 sanity 訊號 |
 | `phaseN_teacher.pth` | teacher backbone；Phase 3 同時含 EMA fusion head 與部署 metadata |
+| `phase3_best.pth` | labeled TIFF Top-5 validation 選出的最佳 EMA 部署 bundle |
+| `phase3_val_stepXXXXXX.json` | 該 step 每張影像的 Top-5 點、分數、GT 距離與命中 rank |
+| `phase3_best_validation.json` | 最佳 checkpoint 對應的完整 validation 報表 |
 | `phase0_auroc.txt` | baseline 門檻(Phase 1+ 的 gate 讀這個)|
 
 **Guardrail**:每個 Phase 同時回報「無缺陷 triplet」的殘差均值/p99 —
@@ -292,6 +298,28 @@ Fusion map 是 `sigmoid(target_unique_logit)`；在 held-out production data 校
 threshold 必須由 held-out normal 與少量人工複核共同決定。舊的 backbone-only checkpoint 仍可使用
 `--method residual` 或 `knn`；沒有 fusion head 卻指定 `--method fusion` 會明確報錯。
 `--method auto` 有 head 時用 fusion，否則警告後 fallback 到 residual-min。
+
+### 檔名座標 validation 與 best checkpoint
+
+每張 labeled TIFF 的 stem 必須以恰好一個 `#x,y` 結尾，例如
+`site_001#123,274.tiff`；預設是 target 原圖的 zero-based `(x,y)`，一張一個 defect。
+若 acquisition 使用 one-based 座標，設定 `eval.coordinate_base: 1`。啟用方式：
+
+```powershell
+& $PY triplet_ssl\train_triplet.py `
+    --config triplet_ssl\configs\phase3_tiff.yaml `
+    --checkpoint <DINOV3_VITB16_CHECKPOINT> `
+    --data-root data\tiff_train `
+    --val-root data\tiff_test `
+    --out-dir triplet_ssl\runs\optical_phase3
+```
+
+Validation 直接重用 production `infer.score_map()`：相同 TIFF reader、channel order、
+normalization、registration、128px tile、32px halo 與 EMA order-aware fusion，完全不
+resize。每張 score grid 取前五名，候選 pixel 座標是 16px patch center；任一候選到
+GT 的歐氏距離嚴格 `<15px` 即命中。Best 依 `Top-5 hit rate`、`Top-1 hit rate`、
+`較小平均最短距離` 依序比較，並 atomic 更新 `phase3_best.pth`。若整個 test 目錄被
+反覆用來選 best，它在統計意義上就是 validation set，而不是獨立 final test。
 
 CPU regression tests：
 

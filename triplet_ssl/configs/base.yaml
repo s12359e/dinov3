@@ -87,6 +87,18 @@ eval:
   n_heatmaps: 10
   residual_mode: mean        # mean = 兩 ref 平均(refs 乾淨時噪聲最低)
                              # min  = double detection(單邊 ref 髒不會誤報)
+  # Native TIFF point-label validation. Enable with --val-root or set a path.
+  # Each filename stem must end in exactly one #x,y; coordinates are target pixels.
+  labeled_tiff_root: null
+  every_steps: 10
+  top_k: 5
+  match_radius_px: 15.0      # strict Euclidean distance: distance < 15px
+  coordinate_base: 0         # set 1 only if acquisition labels are one-based
+  tiff_chunk: 1              # low-VRAM default; increase only after measuring headroom
 
 separability_gate: {min_auroc_delta: 0.0}   # must beat the phase-0 baseline
 seed: 0
+
+# Rank 0 runs the complete labeled validation directory while other DDP ranks
+# wait at a barrier; allow long optical validation sets without a false timeout.
+distributed: {timeout_minutes: 120}
