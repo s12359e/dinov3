@@ -129,11 +129,17 @@ class YOLOSegDataset(Dataset):
     """
 
     def __init__(self, images_dir, labels_dir, transform=None,
-                 img_suffix=".png", binary=True):
+                 img_suffix=".png", binary=True, rois_dir=None):
         self.images_dir = Path(images_dir)
         self.labels_dir = Path(labels_dir)
         self.transform = transform
         self.binary = binary
+        self.rois_dir = Path(rois_dir) if rois_dir is not None else None
+        if self.rois_dir is not None and not self.rois_dir.is_dir():
+            raise FileNotFoundError(
+                f"ROI directory not found: {self.rois_dir}. "
+                f"Generate it first or drop --use_roi_mask."
+            )
 
         self.image_files = sorted(
             [f for f in self.images_dir.iterdir()
@@ -181,10 +187,21 @@ class YOLOSegDataset(Dataset):
         label_path = self.labels_dir / (img_path.stem + ".txt")
         H, W = image.shape[:2]
         mask = self.parse_yolo_label(str(label_path), H, W, self.binary)
+        roi = self.load_roi(img_path.stem, H, W)
 
         if self.transform is not None:
-            image, mask = self.transform(image, mask)
-        return image, mask
+            image, mask, roi = self.transform(image, mask, roi)
+        return image, mask, roi
+
+    def load_roi(self, stem, H, W):
+        """Load the ROI for one sample, or an all-ones ROI when unused."""
+        if self.rois_dir is None:
+            return np.ones((H, W), dtype=np.uint8)
+        roi_path = self.rois_dir / (stem + ".png")
+        roi = cv2.imread(str(roi_path), cv2.IMREAD_GRAYSCALE)
+        if roi is None:
+            raise FileNotFoundError(f"Cannot read ROI: {roi_path}")
+        return (roi > 0).astype(np.uint8)
 
 
 # ====================================================================
@@ -207,12 +224,16 @@ class TrainTransform:
         self.mean = np.array(mean, dtype=np.float32).reshape(1, 1, 3)
         self.std = np.array(std, dtype=np.float32).reshape(1, 1, 3)
 
-    def __call__(self, image, mask):
+    def __call__(self, image, mask, roi=None):
+        if roi is None:
+            roi = np.ones(image.shape[:2], dtype=np.uint8)
+
         scale = np.random.uniform(*self.scale_range)
         h, w = image.shape[:2]
         new_h, new_w = int(h * scale), int(w * scale)
         image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         mask = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+        roi = cv2.resize(roi, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
 
         h, w = image.shape[:2]
         cs = self.img_size
@@ -222,18 +243,24 @@ class TrainTransform:
                                        cv2.BORDER_CONSTANT, value=0)
             mask = cv2.copyMakeBorder(mask, 0, pad_h, 0, pad_w,
                                       cv2.BORDER_CONSTANT, value=255)
+            # Padding is outside the ROI -- 0, not the mask's 255 ignore value.
+            roi = cv2.copyMakeBorder(roi, 0, pad_h, 0, pad_w,
+                                     cv2.BORDER_CONSTANT, value=0)
             h, w = image.shape[:2]
         top = np.random.randint(0, h - cs + 1)
         left = np.random.randint(0, w - cs + 1)
         image = image[top:top + cs, left:left + cs]
         mask = mask[top:top + cs, left:left + cs]
+        roi = roi[top:top + cs, left:left + cs]
 
         if np.random.random() < self.flip_prob:
             image = np.ascontiguousarray(np.fliplr(image))
             mask = np.ascontiguousarray(np.fliplr(mask))
+            roi = np.ascontiguousarray(np.fliplr(roi))
         if np.random.random() < self.flip_prob:
             image = np.ascontiguousarray(np.flipud(image))
             mask = np.ascontiguousarray(np.flipud(mask))
+            roi = np.ascontiguousarray(np.flipud(roi))
 
         img_f = image.astype(np.float32)
         if np.random.random() < 0.5:
@@ -246,7 +273,8 @@ class TrainTransform:
         image = (image.astype(np.float32) - self.mean) / self.std
         image = torch.from_numpy(image).permute(2, 0, 1).float()
         mask = torch.from_numpy(mask.copy()).long()
-        return image, mask
+        roi = torch.from_numpy(roi.copy()).float()
+        return image, mask, roi
 
 
 class ValTransform:
@@ -259,15 +287,20 @@ class ValTransform:
         self.mean = np.array(mean, dtype=np.float32).reshape(1, 1, 3)
         self.std = np.array(std, dtype=np.float32).reshape(1, 1, 3)
 
-    def __call__(self, image, mask):
+    def __call__(self, image, mask, roi=None):
+        if roi is None:
+            roi = np.ones(image.shape[:2], dtype=np.uint8)
         image = cv2.resize(image, (self.img_size, self.img_size),
                            interpolation=cv2.INTER_LINEAR)
         mask = cv2.resize(mask, (self.img_size, self.img_size),
                           interpolation=cv2.INTER_NEAREST)
+        roi = cv2.resize(roi, (self.img_size, self.img_size),
+                         interpolation=cv2.INTER_NEAREST)
         image = (image.astype(np.float32) - self.mean) / self.std
         image = torch.from_numpy(image).permute(2, 0, 1).float()
         mask = torch.from_numpy(mask.copy()).long()
-        return image, mask
+        roi = torch.from_numpy(roi.copy()).float()
+        return image, mask, roi
 
 
 # ====================================================================
@@ -407,8 +440,8 @@ class SegmentationPipeline(nn.Module):
         self.adapter = adapter
         self.decoder = decoder
 
-    def forward(self, x):
-        feats = self.adapter(x)
+    def forward(self, x, roi=None):
+        feats = self.adapter(x, roi=roi)
         return self.decoder(feats, original_size=x.shape[2:])
 
 
@@ -453,6 +486,8 @@ def build_model(args, device):
         add_vit_feature=True,
         use_extra_extractor=True,
         with_cp=args.grad_checkpoint,
+        use_roi_mask=args.use_roi_mask,
+        roi_token_thresh=args.roi_token_thresh,
     )
 
     n_out = {"original": 4, "4-level": 4, "5-level": 5}[args.msda_mode]
@@ -550,13 +585,14 @@ class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
 def validate(model, val_loader, metric, device, amp_enabled=True):
     model.eval()
     metric.reset()
-    for images, masks in val_loader:
+    for images, masks, rois in val_loader:
         images = images.to(device)
         masks = masks.to(device)
+        rois = rois.to(device)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp_enabled):
             # Handle DDP .module access
             m = model.module if isinstance(model, DDP) else model
-            pred = m(images)
+            pred = m(images, roi=rois)
         if pred.shape[-2:] != masks.shape[-2:]:
             pred = F.interpolate(pred, size=masks.shape[-2:],
                                  mode="bilinear", align_corners=False)
@@ -599,12 +635,14 @@ def train(args):
             mean=mean, std=std,
         ),
         binary=args.binary,
+        rois_dir=(data_root / args.roi_subdir / "train") if args.use_roi_mask else None,
     )
     val_ds = YOLOSegDataset(
         images_dir=data_root / "images" / "val",
         labels_dir=data_root / "labels" / "val",
         transform=ValTransform(img_size=args.img_size, mean=mean, std=std),
         binary=args.binary,
+        rois_dir=(data_root / args.roi_subdir / "val") if args.use_roi_mask else None,
     )
 
     # Distributed sampler for training, regular for validation
@@ -698,21 +736,22 @@ def train(args):
     for step in range(start_step + 1, args.max_iters + 1):
         # fetch batch (infinite iteration)
         try:
-            images, masks = next(train_iter)
+            images, masks, rois = next(train_iter)
         except StopIteration:
             epoch += 1
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
             train_iter = iter(train_loader)
-            images, masks = next(train_iter)
+            images, masks, rois = next(train_iter)
 
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
+        rois = rois.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp_enabled):
-            pred = model(images)
+            pred = model(images, roi=rois)
             if pred.shape[-2:] != masks.shape[-2:]:
                 pred = F.interpolate(pred, size=masks.shape[-2:],
                                      mode="bilinear", align_corners=False)
@@ -856,6 +895,14 @@ Examples:
     p.add_argument("--use_pfg", action="store_true",
                    help="Enable Periodic Frequency Gating")
     p.add_argument("--periodic_pitch", type=int, default=22)
+    p.add_argument("--use_roi_mask", action="store_true",
+                   help="Mask out-of-ROI ViT tokens in the adapter's MSDA "
+                        "values; requires <data_root>/<roi_subdir>/{train,val}")
+    p.add_argument("--roi_subdir", type=str, default="rois",
+                   help="Sub-directory of data_root holding the ROI PNGs")
+    p.add_argument("--roi_token_thresh", type=float, default=0.0,
+                   help="ROI coverage above which a ViT token is kept "
+                        "(0.0 keeps any token overlapping the ROI)")
     p.add_argument("--grad_checkpoint", action="store_true", default=True)
 
     # training

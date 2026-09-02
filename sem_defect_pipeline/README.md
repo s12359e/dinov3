@@ -48,7 +48,8 @@ dinov3/
 └── data/sem_defect/                               # Generated dataset (not tracked)
     ├── images/{train,val,test}/*.png
     ├── masks/{train,val,test}/*.png
-    └── labels/{train,val,test}/*.txt
+    ├── labels/{train,val,test}/*.txt
+    └── rois/{train,val,test}/*.png                 # care-area ROI masks
 ```
 
 ---
@@ -95,13 +96,19 @@ python sem_defect_pipeline/data_gen/generate_sem_dataset.py \
 
 ### Output Format
 
-Three parallel directories are generated:
+Four parallel directories are generated:
 
 | Directory | Format | Description |
 |-----------|--------|-------------|
 | `images/` | 3-channel uint8 PNG (R=G=B grayscale) | Input image |
 | `masks/` | Single-channel uint8 PNG (0=bg, 1=defect) | Pixel mask |
 | `labels/` | YOLO segmentation .txt | Normalized polygon coords |
+| `rois/` | Single-channel uint8 PNG (0=outside, 1=care area) | ROI mask |
+
+The ROI is derived from the same candidate list the defect placement uses
+(gate right edge x NEPI band), grown by `--roi_dilate` pixels (default 4).
+It therefore provably contains every defect the generator can produce, and
+covers ~28% of the image area at default settings.
 
 Filenames: `{region}_{split}_{index:05d}.png` (e.g., `logic_train_00042.png`)
 
@@ -120,6 +127,40 @@ Three MSDA (Multi-Scale Deformable Attention) modes:
 | `original` | 3 | 8, 16, 32 | Same as original adapter; c1 (stride 4) bypasses MSDA |
 | `4-level` | 4 | 4, 8, 16, 32 | All 4 scales participate in deformable attention |
 | `5-level` | 5 | 2, 4, 8, 16, 32 | Extra stride-2 level from SPM stem for maximum resolution |
+
+#### ROI mask in MSDA
+
+With `use_roi_mask=True`, `adapter(x, roi=...)` converts the pixel-space ROI
+into an MSDeformAttn `input_padding_mask` at ViT-token resolution and passes
+it down every `Extractor`. The extractor reads ViT tokens as attention
+*values*, so out-of-ROI ViT content is zeroed before it can reach any adapter
+query. `roi=None` restores the original behaviour exactly, so existing
+checkpoints keep working.
+
+Two things to know about the mechanism:
+
+- Deformable attention derives its weights from the query alone, so masked
+  values are zeroed **without renormalising the weights**. The effect is a
+  suppression of out-of-ROI content, not a hard exclusion.
+- Masking happens at token granularity (stride 16 for ViT-B/16), so an ROI
+  finer than the patch grid is necessarily coarsened. `roi_token_thresh`
+  controls how much ROI coverage a token needs to survive; 0.0 (the default)
+  keeps every token that overlaps the ROI at all, which is the safe choice
+  for 4-pixel defects sitting on the ROI boundary.
+
+Measured on the generated dataset (512px, patch 16, 40 images, 25 with a
+defect), showing how much of the ViT value grid gets masked versus whether
+the defect's own tokens survive:
+
+| `roi_token_thresh` | ViT values masked | Defect tokens intact |
+|---|---|---|
+| 0.0 (default) | 29% | 25/25 |
+| 0.2 | 51% | 25/25 |
+| 0.5 | 75% | 21/25 |
+
+`0.2` is the sweet spot for this dataset. A threshold so high that no token
+survives falls back to keeping everything, rather than zeroing the whole
+image's ViT signal.
 
 ```python
 from dinov3.eval.segmentation.models.backbone.dinov3_adapter_v2 import (
@@ -213,6 +254,9 @@ python train_pipeline.py \
     --use_gated_attention \          # enable Semantic Spatial Gate
     --use_pfg \                      # enable Periodic Frequency Gating
     --periodic_pitch 22 \
+    --use_roi_mask \                 # mask out-of-ROI ViT tokens in MSDA
+    --roi_subdir rois \              # data_root sub-dir holding ROI PNGs
+    --roi_token_thresh 0.0 \         # ROI coverage needed to keep a token
     \
     # Data
     --img_size 512 \
@@ -257,10 +301,18 @@ data/sem_defect/
 ├── images/
 │   ├── train/   *.png    # 3-channel uint8
 │   └── val/     *.png
-└── labels/
-    ├── train/   *.txt    # YOLO segmentation format
-    └── val/     *.txt
+├── labels/
+│   ├── train/   *.txt    # YOLO segmentation format
+│   └── val/     *.txt
+└── rois/                 # only needed with --use_roi_mask
+    ├── train/   *.png    # single-channel, non-zero = inside ROI
+    └── val/     *.png
 ```
+
+`rois/` is optional: without `--use_roi_mask` the loader hands the model an
+all-ones ROI and nothing changes. With `--use_roi_mask` a missing `rois/`
+directory or a missing per-image ROI is a hard error rather than a silent
+fallback, so a half-built dataset cannot quietly train without its ROI.
 
 ### Training Features
 
@@ -301,6 +353,10 @@ python -m mmseg.tools.train \
     sem_defect_pipeline/configs/dinov3_adapter_vitb16_fpn_yolo_sem512.py
 ```
 
+> **ROI masking is not available on the MMSeg path.** These configs use the
+> v1 adapter (`dinov3_adapter.py`) via `sem_defect_pipeline/dinov3_backbone.py`,
+> while `use_roi_mask` lives in the v2 adapter used by `train_pipeline.py`.
+
 ### Requirements (MMSeg path only)
 
 ```
@@ -325,6 +381,18 @@ Real semiconductor logic regions have CPODE (Continuous Poly On Diffusion Edge) 
 - Continuous gates = normal for SRAM
 - Cut gates = normal for Logic (not a defect)
 - Extrusion into NEPI = defect (regardless of region)
+
+### Why mask the ROI inside MSDA rather than at the output?
+
+Masking adapter *outputs* only suppresses predictions; the deformable
+attention has already mixed out-of-ROI ViT content into every in-ROI query by
+then. Masking the extractor's values stops that mixing at the source. It also
+sits before the `norms` BatchNorm layers, which is why the mask is applied to
+attention values and not to the normalised feature maps -- feeding zeros into
+BatchNorm would pollute its running statistics as the ROI area varies.
+
+Note the ROI does not reach the ViT itself: the backbone is frozen and takes
+3 channels, so the adapter's trainable branch is the only place it can enter.
 
 ### Why Periodic Frequency Gating?
 

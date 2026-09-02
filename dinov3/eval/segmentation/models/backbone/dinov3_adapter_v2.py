@@ -119,6 +119,34 @@ def deform_inputs(x, patch_size, msda_mode="original"):
     return deform_inputs1, deform_inputs2
 
 
+def build_roi_padding_mask(roi, hw, threshold=0.0):
+    """Turn a pixel-space ROI mask into an MSDeformAttn ``input_padding_mask``.
+
+    Args:
+        roi: (B, 1, H, W) or (B, H, W) tensor in [0, 1]; 1 = inside the ROI.
+        hw: ``(H_tok, W_tok)`` spatial shape of the value grid to mask.
+        threshold: a token is kept when its ROI coverage is *above* this
+            value.  The default of 0.0 keeps every token that overlaps the
+            ROI by even a single pixel, which matters when a 4-pixel defect
+            sits right on the ROI boundary.
+
+    Returns:
+        (B, H_tok * W_tok) bool tensor, ``True`` where the token must be
+        masked out -- MSDeformAttn's convention is True = padding.
+    """
+    if roi.dim() == 3:
+        roi = roi.unsqueeze(1)
+    # 'area' interpolation gives the fraction of ROI pixels per token cell.
+    coverage = F.interpolate(roi.to(torch.float32), size=hw, mode="area")
+    keep = (coverage > threshold).flatten(1)            # (B, N)
+    # A fully masked sample would zero every value and silently drop the whole
+    # ViT signal for that image; keep everything rather than train on nothing.
+    empty = ~keep.any(dim=1)
+    if empty.any():
+        keep[empty] = True
+    return ~keep
+
+
 # ====================================================================
 #  PART 1 -- Configurable ViT-Adapter
 # ====================================================================
@@ -198,12 +226,12 @@ class Extractor(nn.Module):
             self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, query, reference_points, feat, spatial_shapes,
-                level_start_index, level_hw_list):
+                level_start_index, level_hw_list, roi_padding_mask=None):
         def _inner_forward(query, feat):
             attn = self.attn(
                 self.query_norm(query), reference_points,
                 self.feat_norm(feat), spatial_shapes,
-                level_start_index, None,
+                level_start_index, roi_padding_mask,
             )
             query = query + attn
             if self.with_cffn:
@@ -248,7 +276,7 @@ class InteractionBlockWithCls(nn.Module):
             self.extra_extractors = None
 
     def forward(self, x, c, cls, deform_inputs1, deform_inputs2,
-                level_hw_list, H_toks, W_toks):
+                level_hw_list, H_toks, W_toks, roi_padding_mask=None):
         c = self.extractor(
             query=c,
             reference_points=deform_inputs2[0],
@@ -256,6 +284,7 @@ class InteractionBlockWithCls(nn.Module):
             spatial_shapes=deform_inputs2[1],
             level_start_index=deform_inputs2[2],
             level_hw_list=level_hw_list,
+            roi_padding_mask=roi_padding_mask,
         )
         if self.extra_extractors is not None:
             for extractor in self.extra_extractors:
@@ -266,6 +295,7 @@ class InteractionBlockWithCls(nn.Module):
                     spatial_shapes=deform_inputs2[1],
                     level_start_index=deform_inputs2[2],
                     level_hw_list=level_hw_list,
+                    roi_padding_mask=roi_padding_mask,
                 )
         return x, c, cls
 
@@ -358,6 +388,14 @@ class DINOv3_Adapter(nn.Module):
     feature is returned as a side output for the decoder's skip connection.
     This does NOT enter MSDA — it is a lightweight spatial-detail pathway.
 
+    When ``use_roi_mask=True`` and ``forward`` is given a ``roi`` tensor, the
+    ROI is turned into an MSDeformAttn padding mask at ViT-token resolution.
+    The extractor reads ViT tokens as attention *values*, so masking there
+    stops out-of-ROI ViT content from reaching any adapter query.  Note that
+    deformable attention derives its weights from the query alone, so masked
+    values are zeroed without renormalising the weights: the effect is a
+    suppression of out-of-ROI content rather than a hard exclusion.
+
     NOTE: 5-level mode produces significantly more tokens and requires
     proportionally more GPU memory.
     """
@@ -380,11 +418,15 @@ class DINOv3_Adapter(nn.Module):
         use_extra_extractor=True,
         with_cp=True,
         use_stem_skip=False,
+        use_roi_mask=False,
+        roi_token_thresh=0.0,
     ):
         super().__init__()
         assert msda_mode in ("original", "4-level", "5-level")
         self.msda_mode = msda_mode
         self.use_stem_skip = use_stem_skip and msda_mode != "5-level"
+        self.use_roi_mask = use_roi_mask
+        self.roi_token_thresh = roi_token_thresh
         self.backbone = backbone
         self.backbone.requires_grad_(False)
 
@@ -470,11 +512,26 @@ class DINOv3_Adapter(nn.Module):
 
     # -- forward ---------------------------------------------------------------
 
-    def forward(self, x):
+    def forward(self, x, roi=None):
+        """
+        Args:
+            x: (B, 3, H, W) input image.
+            roi: optional (B, 1, H, W) or (B, H, W) ROI mask in [0, 1], where
+                1 marks the region to inspect.  Only used when the adapter was
+                built with ``use_roi_mask=True``; ignored otherwise.
+        """
         bs, C_in, h, w = x.shape
         embed_dim = self.backbone.embed_dim
         H_toks = h // self.patch_size
         W_toks = w // self.patch_size
+
+        # ROI -> MSDeformAttn padding mask over the ViT token grid, which is
+        # what the extractor uses as attention values.
+        roi_padding_mask = None
+        if self.use_roi_mask and roi is not None:
+            roi_padding_mask = build_roi_padding_mask(
+                roi, (H_toks, W_toks), self.roi_token_thresh
+            )
 
         # 1) Spatial Prior Module  (list of 4-D spatial tensors, finest first)
         spm_feats, c_half_raw = self.spm(x)
@@ -519,6 +576,7 @@ class DINOv3_Adapter(nn.Module):
                 vit_x, c, cls,
                 deform_in1, deform_in2,
                 level_hw_list, H_toks, W_toks,
+                roi_padding_mask=roi_padding_mask,
             )
             outs.append(
                 vit_x.transpose(1, 2)
@@ -909,6 +967,8 @@ def build_pipeline(
     use_novel_enhancement=False,
     periodic_pitch=22,
     use_stem_skip=False,
+    use_roi_mask=False,
+    roi_token_thresh=0.0,
     backbone=None,
 ):
     """Convenience builder for the full Adapter -> Decoder pipeline.
@@ -921,6 +981,11 @@ def build_pipeline(
             feature map instead of ~1 pixel at stride-4.
             Only effective for 'original' and '4-level' modes (5-level
             already has stride-2 in MSDA).
+        use_roi_mask: if True, ``adapter(x, roi=...)`` masks out-of-ROI ViT
+            tokens in the deformable-attention values.  Passing ``roi=None``
+            keeps the original behaviour.
+        roi_token_thresh: ROI coverage above which a token is kept (0.0 keeps
+            any token that overlaps the ROI at all).
     """
     if backbone is None:
         backbone = _MockDINOv3Backbone(embed_dim=embed_dim, patch_size=patch_size)
@@ -934,6 +999,8 @@ def build_pipeline(
         deform_num_heads=16,
         with_cp=False,
         use_stem_skip=use_stem_skip,
+        use_roi_mask=use_roi_mask,
+        roi_token_thresh=roi_token_thresh,
     )
 
     n_out = {"original": 4, "4-level": 4, "5-level": 5}[msda_mode]
@@ -1012,3 +1079,36 @@ if __name__ == "__main__":
         logits = decoder(feats, original_size=(448, 448))
         print(f"Decoder logits: {tuple(logits.shape)}")
         print(f"  -> Full resolution output (no bilinear upsample needed)")
+
+    # Test ROI mask in MSDA
+    print(f"\n{'='*60}")
+    print("  msda_mode = '4-level' + use_roi_mask=True")
+    print(f"{'='*60}")
+
+    adapter, decoder = build_pipeline(
+        msda_mode="4-level",
+        embed_dim=384,
+        num_classes=2,
+        use_roi_mask=True,
+    )
+    adapter = adapter.to(device).eval()
+    decoder = decoder.to(device).eval()
+
+    # ROI = central half of the image
+    roi = torch.zeros(1, 1, 448, 448, device=device)
+    roi[:, :, 112:336, 112:336] = 1.0
+
+    # Re-seed so the mock backbone yields identical ViT features both times,
+    # leaving the ROI mask as the only difference.
+    torch.manual_seed(0)
+    feats_roi = adapter(img, roi=roi)
+    torch.manual_seed(0)
+    feats_none = adapter(img, roi=None)
+    print("Adapter outputs:")
+    for k in sorted(feats_roi.keys(), key=lambda k: (not k.isdigit(), k)):
+        print(f"  level {k}: {tuple(feats_roi[k].shape)}")
+    delta = (feats_roi["0"] - feats_none["0"]).abs().mean().item()
+    print(f"mean |roi - no_roi| on level 0: {delta:.6f}  (must be > 0)")
+
+    logits = decoder(feats_roi, original_size=(448, 448))
+    print(f"Decoder logits: {tuple(logits.shape)}")

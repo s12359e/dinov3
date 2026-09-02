@@ -35,6 +35,7 @@ Output
 images/  — 3-channel uint8 PNG (grayscale replicated to R=G=B)
 masks/   — single-channel uint8 PNG  (0=background, 1=defect)
 labels/  — YOLO segmentation .txt (normalized polygon coordinates)
+rois/    — single-channel uint8 PNG  (0=outside, 1=care area)
 
 Usage
 -----
@@ -181,6 +182,41 @@ class SEMImageGenerator:
                     candidates.append((defect_x, y_lo, y_hi))
 
         return candidates
+
+    def roi_mask(self, phase_offset: int, dilate: int = 4) -> np.ndarray:
+        """
+        Build the care-area ROI: every pixel a defect could physically occupy.
+
+        Derived from the same candidate list that defect placement uses, so
+        the ROI provably contains every defect this generator can produce.
+
+        Parameters
+        ----------
+        phase_offset : the gate phase of the image this ROI belongs to
+                       (available as meta['gate_phase_offset']).
+        dilate       : margin in pixels grown around each candidate region.
+                       A real care area is never drawn pixel-tight, and a
+                       margin keeps boundary defects well inside the ROI.
+
+        Returns
+        -------
+        roi : np.ndarray, shape (H, W), dtype uint8.  0 = outside, 1 = inside.
+        """
+        H, W = self.height, self.width
+        ds = self.defect_size
+        roi = np.zeros((H, W), dtype=np.uint8)
+
+        gates = self._gate_columns(phase_offset)
+        bands = self._band_regions()
+        for (dx, y_lo, y_hi) in self._find_defect_candidates(gates, bands):
+            # A defect at (dx, dy) covers [dy, dy+ds) for dy in [y_lo, y_hi].
+            x0 = max(0, dx - dilate)
+            x1 = min(W, dx + ds + dilate)
+            y0 = max(0, y_lo - dilate)
+            y1 = min(H, y_hi + ds + dilate)
+            roi[y0:y1, x0:x1] = 1
+
+        return roi
 
     def _generate_gate_cuts(self, gates, bands, rng):
         """
@@ -363,6 +399,7 @@ def generate_dataset(
     n_test_ratio: float = 0.15,
     defect_ratio: float = 0.7,
     seed: int = 42,
+    roi_dilate: int = 4,
     generator_kwargs: dict = None,
 ):
     """
@@ -378,6 +415,7 @@ def generate_dataset(
     n_test_ratio    : fraction for test split (default 0.15).
     defect_ratio    : fraction of images with a defect.
     seed            : global random seed.
+    roi_dilate      : margin in pixels grown around the care-area ROI.
     generator_kwargs: extra kwargs forwarded to SEMImageGenerator.__init__.
     """
     if regions is None:
@@ -405,9 +443,11 @@ def generate_dataset(
             img_dir   = output_dir / 'images' / split
             mask_dir  = output_dir / 'masks'  / split
             label_dir = output_dir / 'labels' / split
+            roi_dir   = output_dir / 'rois'   / split
             img_dir.mkdir(parents=True, exist_ok=True)
             mask_dir.mkdir(parents=True, exist_ok=True)
             label_dir.mkdir(parents=True, exist_ok=True)
+            roi_dir.mkdir(parents=True, exist_ok=True)
 
             print(f"Generating {n} {region.upper()} images for split='{split}' ...")
             split_meta = []
@@ -416,9 +456,14 @@ def generate_dataset(
                 with_defect = (rng.random() < defect_ratio)
                 img, mask, meta = gen.generate(with_defect=with_defect, rng=rng)
 
+                # ROI follows the image's own gate phase, so it lines up
+                # with the gates actually drawn in this image.
+                roi = gen.roi_mask(meta['gate_phase_offset'], dilate=roi_dilate)
+
                 stem = f"{region}_{split}_{i:05d}"
                 cv2.imwrite(str(img_dir   / f"{stem}.png"), img)
                 cv2.imwrite(str(mask_dir  / f"{stem}.png"), mask)
+                cv2.imwrite(str(roi_dir   / f"{stem}.png"), roi)
 
                 # Write YOLO segmentation label
                 yolo_txt = _mask_to_yolo_label(mask, class_id=0)
@@ -432,6 +477,7 @@ def generate_dataset(
             all_metadata[key] = split_meta
             n_defect = sum(1 for m in split_meta if m['has_defect'])
             print(f"  {n_defect}/{n} images have defects ({100*n_defect/n:.1f}%)")
+            print(f"  ROI covers {100 * roi.mean():.1f}% of the image area")
 
     # Save metadata
     with open(output_dir / 'metadata.json', 'w') as f:
@@ -510,6 +556,8 @@ def parse_args():
                    help='Height of each PEPI or NEPI band')
     p.add_argument('--noise_std',     type=float, default=12.0)
     p.add_argument('--blur_sigma',    type=float, default=0.7)
+    p.add_argument('--roi_dilate',    type=int,   default=4,
+                   help='Margin in px grown around the care-area ROI in rois/')
     p.add_argument('--preview',       action='store_true',
                    help='Generate and show one sample before writing dataset')
     p.add_argument('--preview_save',  default=None,
@@ -547,6 +595,7 @@ def main():
         regions=args.region,
         defect_ratio=args.defect_ratio,
         seed=args.seed,
+        roi_dilate=args.roi_dilate,
         generator_kwargs=generator_kwargs,
     )
 
