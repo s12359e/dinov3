@@ -130,23 +130,44 @@ Three MSDA (Multi-Scale Deformable Attention) modes:
 
 #### ROI mask in MSDA
 
-With `use_roi_mask=True`, `adapter(x, roi=...)` converts the pixel-space ROI
-into an MSDeformAttn `input_padding_mask` at ViT-token resolution and passes
-it down every `Extractor`. The extractor reads ViT tokens as attention
-*values*, so out-of-ROI ViT content is zeroed before it can reach any adapter
-query. `roi=None` restores the original behaviour exactly, so existing
-checkpoints keep working.
+With `use_roi_mask=True`, `adapter(x, roi=...)` restricts the extractor's
+deformable attention to the ROI. `roi=None` restores the original behaviour
+exactly, so existing checkpoints keep working. `roi_mask_mode` picks the
+mechanism:
 
-Two things to know about the mechanism:
+| mode | what it does |
+|---|---|
+| `value` (default) | ROI becomes an MSDeformAttn `input_padding_mask`; out-of-ROI ViT tokens are zeroed on the *value* side |
+| `weight` | each query's attention weights are scaled by ROI membership at their sampling locations and renormalised |
+| `both` | apply each |
 
-- Deformable attention derives its weights from the query alone, so masked
-  values are zeroed **without renormalising the weights**. The effect is a
-  suppression of out-of-ROI content, not a hard exclusion.
-- Masking happens at token granularity (stride 16 for ViT-B/16), so an ROI
-  finer than the patch grid is necessarily coarsened. `roi_token_thresh`
-  controls how much ROI coverage a token needs to survive; 0.0 (the default)
-  keeps every token that overlaps the ROI at all, which is the safe choice
-  for 4-pixel defects sitting on the ROI boundary.
+**These two are not interchangeable.** `value` provably stops out-of-ROI
+content from reaching a query, but it leaves the attention weights untouched:
+weight spent outside the ROI is simply wasted, and the zeroed region doubles
+as a free "off switch" that the model can learn to sample into. A 300-step
+controlled run on the generated data showed exactly that — attention weight
+landing inside the ROI *fell* from 39.2% to 36.9% while the zeroed share rose
+from 39.1% to 46.8%, against a control (`use_roi_mask=False`) that stayed
+flat at ~39%.
+
+`weight` fixes the incentive: the whole budget is renormalised over the ROI,
+and because `grid_sample` is differentiable w.r.t. the sampling locations the
+offsets get a gradient pulling them *into* the ROI, which `value` mode has no
+mechanism for. At initialisation alone it moves attention weight inside the
+ROI from 44.4% to 68.1% on a 512px sample. It does not reach 100% because ROI
+membership is sampled bilinearly, so a point in a dropped cell adjacent to a
+kept one keeps partial weight — that softness is what supplies the gradient.
+
+Masking happens at token granularity (stride 16 for ViT-B/16), so an ROI finer
+than the patch grid is necessarily coarsened. `roi_token_thresh` controls how
+much ROI coverage a token needs to survive; 0.0 (the default) keeps every
+token that overlaps the ROI at all, the safe choice for 4-pixel defects
+sitting on the ROI boundary.
+
+Note that `add_vit_feature=True` (the default) adds the **unmasked** ViT
+feature maps back into the adapter's outputs after the interaction blocks, so
+it re-injects out-of-ROI ViT content regardless of `roi_mask_mode`. Masking
+the ROI end-to-end would require gating that residual too.
 
 Measured on the generated dataset (512px, patch 16, 40 images, 25 with a
 defect), showing how much of the ViT value grid gets masked versus whether
@@ -254,7 +275,8 @@ python train_pipeline.py \
     --use_gated_attention \          # enable Semantic Spatial Gate
     --use_pfg \                      # enable Periodic Frequency Gating
     --periodic_pitch 22 \
-    --use_roi_mask \                 # mask out-of-ROI ViT tokens in MSDA
+    --use_roi_mask \                 # restrict MSDA attention to the ROI
+    --roi_mask_mode value \          # value | weight | both
     --roi_subdir rois \              # data_root sub-dir holding ROI PNGs
     --roi_token_thresh 0.0 \         # ROI coverage needed to keep a token
     \

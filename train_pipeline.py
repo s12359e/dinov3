@@ -484,6 +484,7 @@ def build_model(args):
         use_extra_extractor=True,
         with_cp=args.grad_checkpoint,
         use_roi_mask=args.use_roi_mask,
+        roi_mask_mode=args.roi_mask_mode,
         roi_token_thresh=args.roi_token_thresh,
     )
 
@@ -832,6 +833,12 @@ def parse_args():
     p.add_argument("--use_roi_mask", action="store_true",
                    help="Mask out-of-ROI ViT tokens in the adapter's MSDA "
                         "values; requires <data_root>/<roi_subdir>/{train,val}")
+    p.add_argument("--roi_mask_mode", type=str, default="value",
+                   choices=["value", "weight", "both"],
+                   help="'value' zeroes out-of-ROI attention values; 'weight' "
+                        "renormalises each query's attention weights over the "
+                        "ROI (also gives the sampling offsets a gradient "
+                        "pulling them into the ROI); 'both' applies each")
     p.add_argument("--roi_subdir", type=str, default="rois",
                    help="Sub-directory of data_root holding the ROI PNGs")
     p.add_argument("--roi_token_thresh", type=float, default=0.0,

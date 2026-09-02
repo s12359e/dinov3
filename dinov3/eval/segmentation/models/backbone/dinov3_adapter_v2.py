@@ -226,12 +226,13 @@ class Extractor(nn.Module):
             self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, query, reference_points, feat, spatial_shapes,
-                level_start_index, level_hw_list, roi_padding_mask=None):
+                level_start_index, level_hw_list, roi_padding_mask=None,
+                roi_map=None):
         def _inner_forward(query, feat):
             attn = self.attn(
                 self.query_norm(query), reference_points,
                 self.feat_norm(feat), spatial_shapes,
-                level_start_index, roi_padding_mask,
+                level_start_index, roi_padding_mask, roi_map,
             )
             query = query + attn
             if self.with_cffn:
@@ -276,7 +277,8 @@ class InteractionBlockWithCls(nn.Module):
             self.extra_extractors = None
 
     def forward(self, x, c, cls, deform_inputs1, deform_inputs2,
-                level_hw_list, H_toks, W_toks, roi_padding_mask=None):
+                level_hw_list, H_toks, W_toks, roi_padding_mask=None,
+                roi_map=None):
         c = self.extractor(
             query=c,
             reference_points=deform_inputs2[0],
@@ -285,6 +287,7 @@ class InteractionBlockWithCls(nn.Module):
             level_start_index=deform_inputs2[2],
             level_hw_list=level_hw_list,
             roi_padding_mask=roi_padding_mask,
+            roi_map=roi_map,
         )
         if self.extra_extractors is not None:
             for extractor in self.extra_extractors:
@@ -296,6 +299,7 @@ class InteractionBlockWithCls(nn.Module):
                     level_start_index=deform_inputs2[2],
                     level_hw_list=level_hw_list,
                     roi_padding_mask=roi_padding_mask,
+                    roi_map=roi_map,
                 )
         return x, c, cls
 
@@ -389,12 +393,21 @@ class DINOv3_Adapter(nn.Module):
     This does NOT enter MSDA — it is a lightweight spatial-detail pathway.
 
     When ``use_roi_mask=True`` and ``forward`` is given a ``roi`` tensor, the
-    ROI is turned into an MSDeformAttn padding mask at ViT-token resolution.
-    The extractor reads ViT tokens as attention *values*, so masking there
-    stops out-of-ROI ViT content from reaching any adapter query.  Note that
-    deformable attention derives its weights from the query alone, so masked
-    values are zeroed without renormalising the weights: the effect is a
-    suppression of out-of-ROI content rather than a hard exclusion.
+    ROI restricts the extractor's deformable attention.  ``roi_mask_mode``
+    picks how:
+
+    * ``'value'`` -- ROI becomes an MSDeformAttn padding mask, zeroing
+      out-of-ROI ViT tokens on the *value* side.  Out-of-ROI content provably
+      cannot reach a query, but the attention weights are unchanged and are
+      not renormalised, so weight spent outside the ROI is simply wasted --
+      and a masked region doubles as a free "off switch" the model can learn
+      to sample into.
+    * ``'weight'`` -- each query's attention weights are scaled by the ROI
+      membership at their sampling locations and renormalised, so the whole
+      budget is spent inside the ROI.  ``grid_sample`` is differentiable
+      w.r.t. the sampling locations, so this also gives the offsets a gradient
+      that pulls them into the ROI -- the 'value' mode has no such gradient.
+    * ``'both'`` -- apply both.
 
     NOTE: 5-level mode produces significantly more tokens and requires
     proportionally more GPU memory.
@@ -419,13 +432,16 @@ class DINOv3_Adapter(nn.Module):
         with_cp=True,
         use_stem_skip=False,
         use_roi_mask=False,
+        roi_mask_mode="value",
         roi_token_thresh=0.0,
     ):
         super().__init__()
         assert msda_mode in ("original", "4-level", "5-level")
         self.msda_mode = msda_mode
         self.use_stem_skip = use_stem_skip and msda_mode != "5-level"
+        assert roi_mask_mode in ("value", "weight", "both")
         self.use_roi_mask = use_roi_mask
+        self.roi_mask_mode = roi_mask_mode
         self.roi_token_thresh = roi_token_thresh
         self.backbone = backbone
         self.backbone.requires_grad_(False)
@@ -527,11 +543,15 @@ class DINOv3_Adapter(nn.Module):
 
         # ROI -> MSDeformAttn padding mask over the ViT token grid, which is
         # what the extractor uses as attention values.
-        roi_padding_mask = None
+        roi_padding_mask, roi_map = None, None
         if self.use_roi_mask and roi is not None:
-            roi_padding_mask = build_roi_padding_mask(
-                roi, (H_toks, W_toks), self.roi_token_thresh
-            )
+            pad = build_roi_padding_mask(roi, (H_toks, W_toks), self.roi_token_thresh)
+            if self.roi_mask_mode in ("value", "both"):
+                roi_padding_mask = pad
+            if self.roi_mask_mode in ("weight", "both"):
+                # Same kept/dropped decision as the padding mask, as a spatial
+                # map the extractor can sample at its attention locations.
+                roi_map = [(~pad).to(x.dtype).view(bs, 1, H_toks, W_toks)]
 
         # 1) Spatial Prior Module  (list of 4-D spatial tensors, finest first)
         spm_feats, c_half_raw = self.spm(x)
@@ -577,6 +597,7 @@ class DINOv3_Adapter(nn.Module):
                 deform_in1, deform_in2,
                 level_hw_list, H_toks, W_toks,
                 roi_padding_mask=roi_padding_mask,
+                roi_map=roi_map,
             )
             outs.append(
                 vit_x.transpose(1, 2)
@@ -968,6 +989,7 @@ def build_pipeline(
     periodic_pitch=22,
     use_stem_skip=False,
     use_roi_mask=False,
+    roi_mask_mode="value",
     roi_token_thresh=0.0,
     backbone=None,
 ):
@@ -981,9 +1003,11 @@ def build_pipeline(
             feature map instead of ~1 pixel at stride-4.
             Only effective for 'original' and '4-level' modes (5-level
             already has stride-2 in MSDA).
-        use_roi_mask: if True, ``adapter(x, roi=...)`` masks out-of-ROI ViT
-            tokens in the deformable-attention values.  Passing ``roi=None``
-            keeps the original behaviour.
+        use_roi_mask: if True, ``adapter(x, roi=...)`` restricts the extractor's
+            deformable attention to the ROI.  Passing ``roi=None`` keeps the
+            original behaviour.
+        roi_mask_mode: 'value' (mask attention values), 'weight' (renormalise
+            attention weights over the ROI) or 'both'.
         roi_token_thresh: ROI coverage above which a token is kept (0.0 keeps
             any token that overlaps the ROI at all).
     """
@@ -1000,6 +1024,7 @@ def build_pipeline(
         with_cp=False,
         use_stem_skip=use_stem_skip,
         use_roi_mask=use_roi_mask,
+        roi_mask_mode=roi_mask_mode,
         roi_token_thresh=roi_token_thresh,
     )
 

@@ -96,6 +96,49 @@ def _is_power_of_2(n):
     return (n & (n - 1) == 0) and n != 0
 
 
+def roi_renormalize_attention(attention_weights, sampling_locations, roi_map, eps=1e-6):
+    """Restrict each query's attention budget to the ROI, then renormalise.
+
+    Masking *values* only zeroes a sampling point's contribution; it neither
+    attracts nor repels the point, and it leaves the spent weight stranded.
+    Scaling the *weights* by the ROI membership at each sampling location and
+    renormalising forces every query to spend its whole budget inside the ROI,
+    and — because ``grid_sample`` is differentiable w.r.t. the sampling
+    locations — gives the offsets a gradient that pulls them into the ROI.
+
+    Args:
+        attention_weights: (N, Lq, n_heads, n_levels, n_points), already
+            softmaxed over the joint (level, point) axis.
+        sampling_locations: (N, Lq, n_heads, n_levels, n_points, 2), normalised
+            to [0, 1] over each level's grid.
+        roi_map: list of ``n_levels`` tensors (N, 1, H_l, W_l) holding ROI
+            membership in [0, 1] at that level's resolution.
+        eps: guard for queries whose sampling points all miss the ROI.
+
+    Returns:
+        Renormalised attention weights, same shape. A (query, head) whose
+        points all land outside the ROI keeps its original weights rather than
+        being amplified by a near-zero denominator.
+    """
+    N, Lq, n_heads, n_levels, n_points, _ = sampling_locations.shape
+    assert len(roi_map) == n_levels, f"roi_map has {len(roi_map)} levels, expected {n_levels}"
+
+    grid = 2.0 * sampling_locations - 1.0                     # grid_sample convention
+    memberships = []
+    for lvl in range(n_levels):
+        g = grid[:, :, :, lvl].reshape(N, Lq, n_heads * n_points, 2)
+        m = F.grid_sample(
+            roi_map[lvl].to(grid.dtype), g,
+            mode="bilinear", padding_mode="zeros", align_corners=False,
+        )                                                     # (N, 1, Lq, heads*points)
+        memberships.append(m.squeeze(1).view(N, Lq, n_heads, n_points))
+    membership = torch.stack(memberships, dim=3)              # (N, Lq, heads, levels, points)
+
+    scaled = attention_weights * membership
+    denom = scaled.sum(dim=(-2, -1), keepdim=True)
+    return torch.where(denom > eps, scaled / denom.clamp_min(eps), attention_weights)
+
+
 class MSDeformAttn(nn.Module):
     def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4, ratio=1.0):
         """Multi-Scale Deformable Attention Module.
@@ -161,6 +204,7 @@ class MSDeformAttn(nn.Module):
         input_spatial_shapes,
         input_level_start_index,
         input_padding_mask=None,
+        roi_map=None,
     ):
         """
         :param query                       (N, Length_{query}, C)
@@ -170,6 +214,9 @@ class MSDeformAttn(nn.Module):
         :param input_spatial_shapes        (n_levels, 2), [(H_0, W_0), (H_1, W_1), ..., (H_{L-1}, W_{L-1})]
         :param input_level_start_index     (n_levels, ), [0, H_0*W_0, H_0*W_0+H_1*W_1, H_0*W_0+H_1*W_1+H_2*W_2, ..., H_0*W_0+H_1*W_1+...+H_{L-1}*W_{L-1}]
         :param input_padding_mask          (N, \\sum_{l=0}^{L-1} H_l \\cdot W_l), True for padding elements, False for non-padding elements
+        :param roi_map                     optional list of n_levels tensors (N, 1, H_l, W_l) with ROI
+                                        membership in [0, 1]; when given, each query's attention
+                                        weights are restricted to the ROI and renormalised
 
         :return output                     (N, Length_{query}, C)
         """
@@ -202,6 +249,13 @@ class MSDeformAttn(nn.Module):
             raise ValueError(
                 "Last dim of reference_points must be 2 or 4, but get {} instead.".format(reference_points.shape[-1])
             )
+        if roi_map is not None:
+            # fp32: MSDeformAttnFunction casts its inputs to fp32 anyway, and the
+            # renormalising division should not run in bf16.
+            attention_weights = roi_renormalize_attention(
+                attention_weights.float(), sampling_locations.float(), roi_map
+            ).to(attention_weights.dtype)
+
         output = MSDeformAttnFunction.apply(
             value,
             input_spatial_shapes,
