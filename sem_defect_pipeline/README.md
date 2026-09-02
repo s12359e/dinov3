@@ -143,20 +143,39 @@ mechanism:
 
 **These two are not interchangeable.** `value` provably stops out-of-ROI
 content from reaching a query, but it leaves the attention weights untouched:
-weight spent outside the ROI is simply wasted, and the zeroed region doubles
-as a free "off switch" that the model can learn to sample into. A 300-step
-controlled run on the generated data showed exactly that — attention weight
-landing inside the ROI *fell* from 39.2% to 36.9% while the zeroed share rose
-from 39.1% to 46.8%, against a control (`use_roi_mask=False`) that stayed
-flat at ~39%.
+weight spent outside the ROI is wasted, and the zeroed region doubles as a
+free "off switch" the model can learn to sample into.
 
-`weight` fixes the incentive: the whole budget is renormalised over the ROI,
-and because `grid_sample` is differentiable w.r.t. the sampling locations the
-offsets get a gradient pulling them *into* the ROI, which `value` mode has no
-mechanism for. At initialisation alone it moves attention weight inside the
-ROI from 44.4% to 68.1% on a 512px sample. It does not reach 100% because ROI
-membership is sampled bilinearly, so a point in a dropped cell adjacent to a
-kept one keeps partial weight — that softness is what supplies the gradient.
+A three-arm controlled run (300 steps, identical seed / data order / init,
+256px, randomly initialised ViT) measured the share of each query's attention
+weight by where its sampling points land:
+
+| arm | inside ROI, step 0 → 300 | outside ROI, step 0 → 300 | final loss |
+|---|---|---|---|
+| control (`use_roi_mask=False`) | 39.2 → 38.0 (−1.2) | 39.1 → 38.9 (−0.2) | 1.4871 |
+| `value` | 39.2 → 36.9 (−2.3) | 39.1 → **46.8 (+7.7)** | 1.4838 |
+| `weight` | **66.8** → **64.8** (−2.0) | 19.6 → 22.0 (+2.4) | 1.4850 |
+
+Two readings. First, `value` mode's "off switch" is real: its out-of-ROI share
+climbs +7.7 points against a control that stays flat, i.e. training moves
+attention *away* from the care area. `weight` mode largely removes that
+(+2.4, near the control).
+
+Second, `weight` mode's benefit is its **level**, not a learned trend: it
+starts and stays around 65% inside the ROI versus ~38%, which follows from the
+renormalisation by construction. The bilinear ROI membership does make the
+sampling locations differentiable, but over 300 steps that did not produce net
+movement into the ROI — the inside-ROI share drifted slightly *down* in all
+three arms. Treat "the offsets learn to concentrate" as unverified; what is
+verified is the much higher starting level, held throughout training. The
+share does not reach 100% because membership is sampled bilinearly, so a point
+in a dropped cell adjacent to a kept one keeps partial weight.
+
+All three arms ended at essentially the same loss, so at this scale the ROI
+mechanism changes attention placement without changing segmentation quality.
+The run used a randomly initialised ViT (no pretrained DINOv3 weights), where
+there is no real signal inside the ROI to learn to attend to; repeat it with a
+real checkpoint before drawing conclusions about training dynamics.
 
 Masking happens at token granularity (stride 16 for ViT-B/16), so an ROI finer
 than the patch grid is necessarily coarsened. `roi_token_thresh` controls how
